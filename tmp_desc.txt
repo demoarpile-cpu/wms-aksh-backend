@@ -1,0 +1,1 @@
+No description found for "supplier_products" table. Check the table name and schema; remember, they _are_ case sensitive.
