@@ -1,6 +1,20 @@
 const { GoodsReceipt, GoodsReceiptItem, PurchaseOrder, PurchaseOrderItem, Supplier, Product, ProductStock, Warehouse } = require('../models');
 const { validateHeatSensitivePlacement } = require('./inventoryService');
 
+function isTruthyYes(value) {
+  const normalized = String(value == null ? '' : value).trim().toLowerCase();
+  if (!normalized) return false;
+  return normalized === 'yes' || normalized === 'true' || normalized === '1' || normalized === 'y' || normalized === 'on';
+}
+
+function requiresBatchTracking(product) {
+  return isTruthyYes(product?.requireBatchTracking);
+}
+
+function isPerishableProduct(product) {
+  return isTruthyYes(product?.isPerishable) || isTruthyYes(product?.perishable);
+}
+
 async function list(reqUser, query = {}) {
   const where = {};
   if (reqUser.role === 'super_admin') {
@@ -16,7 +30,7 @@ async function list(reqUser, query = {}) {
     include: [
       { association: 'PurchaseOrder', include: [{ association: 'Supplier', attributes: ['id', 'name'] }] },
       { association: 'Warehouse', attributes: ['id', 'name', 'code'] },
-      { association: 'GoodsReceiptItems', include: [{ association: 'Product', attributes: ['id', 'name', 'sku'] }] },
+      { association: 'GoodsReceiptItems', include: [{ association: 'Product', attributes: ['id', 'name', 'sku', 'requireBatchTracking', 'perishable'] }] },
     ],
   });
   applyGrnDisplayNormalization(receipts);
@@ -48,7 +62,7 @@ async function getById(id, reqUser) {
     include: [
       { association: 'PurchaseOrder', include: ['Supplier'] },
       { association: 'Warehouse', attributes: ['id', 'name', 'code'] },
-      { association: 'GoodsReceiptItems', include: ['Product'] },
+      { association: 'GoodsReceiptItems', include: [{ association: 'Product', attributes: ['id', 'name', 'sku', 'requireBatchTracking', 'perishable'] }] },
     ],
   });
   if (!gr) throw new Error('Goods receipt not found');
@@ -72,6 +86,15 @@ async function create(body, reqUser) {
   if (!po || po.companyId !== companyId) throw new Error('Purchase order not found');
   if ((po.status || '').toLowerCase() !== 'approved') throw new Error('Only approved purchase orders can be received');
 
+  const warehouseId = Number(body.warehouseId);
+  if (!Number.isFinite(warehouseId) || warehouseId <= 0) {
+    throw new Error('Warehouse is required for GRN creation');
+  }
+  const warehouse = await Warehouse.findByPk(warehouseId);
+  if (!warehouse || warehouse.companyId !== companyId) {
+    throw new Error('Invalid warehouse');
+  }
+
   // GRN number format: GRN001, GRN002, GRN003, ... (sequential per company)
   const all = await GoodsReceipt.findAll({ where: { companyId }, attributes: ['grNumber'], raw: true });
   const existingNums = all.map((r) => (r.grNumber || '').match(/^GRN(\d+)$/i)).filter(Boolean).map((m) => parseInt(m[1], 10));
@@ -83,7 +106,7 @@ async function create(body, reqUser) {
   const gr = await GoodsReceipt.create({
     companyId,
     purchaseOrderId: po.id,
-    warehouseId: po.warehouseId || body.warehouseId || null,
+    warehouseId,
     grNumber,
     status: 'pending',
     notes: body.notes || null,
@@ -189,23 +212,41 @@ async function updateReceived(id, body, reqUser) {
 }
 
 async function updateAsnItems(id, body, reqUser) {
-  const gr = await GoodsReceipt.findByPk(id, { include: ['GoodsReceiptItems'] });
+  const gr = await GoodsReceipt.findByPk(id, {
+    include: [{ association: 'GoodsReceiptItems', include: [{ association: 'Product', attributes: ['id', 'name', 'sku', 'requireBatchTracking', 'perishable'] }] }],
+  });
   if (!gr) throw new Error('ASN not found');
   if (reqUser.role !== 'super_admin' && gr.companyId !== reqUser.companyId) throw new Error('Not authorized');
 
   if (body.deliveryType) gr.deliveryType = body.deliveryType;
   if (body.eta) gr.eta = body.eta;
-  if (body.warehouseId) gr.warehouseId = body.warehouseId;
+  if (body.warehouseId) {
+    const wh = await Warehouse.findByPk(body.warehouseId);
+    if (!wh || wh.companyId !== gr.companyId) throw new Error('Invalid warehouse');
+    gr.warehouseId = body.warehouseId;
+  }
   await gr.save();
 
   if (Array.isArray(body.items)) {
     for (const item of body.items) {
       const dbItem = gr.GoodsReceiptItems.find(i => i.id === item.id);
       if (dbItem) {
+        const product = dbItem.Product || (await Product.findByPk(dbItem.productId));
+        const qtyToBook = item.qtyToBook ?? dbItem.qtyToBook;
+        const batchVal = item.batchId ?? dbItem.batchId ?? null;
+        const bbdVal = item.bestBeforeDate ?? dbItem.bestBeforeDate ?? null;
+        if (Number(qtyToBook) > 0) {
+          if (requiresBatchTracking(product) && !String(batchVal || '').trim()) {
+            throw new Error(`${product?.name || dbItem.productName || 'Product'} requires Batch Number because batch tracking is enabled.`);
+          }
+          if (isPerishableProduct(product) && !bbdVal) {
+            throw new Error(`${product?.name || dbItem.productName || 'Product'} requires Expiry/Best Before date because product is perishable.`);
+          }
+        }
         await dbItem.update({
-          batchId: item.batchId || dbItem.batchId,
-          bestBeforeDate: item.bestBeforeDate || dbItem.bestBeforeDate,
-          qtyToBook: item.qtyToBook ?? dbItem.qtyToBook,
+          batchId: requiresBatchTracking(product) ? batchVal : null,
+          bestBeforeDate: isPerishableProduct(product) ? bbdVal : null,
+          qtyToBook,
           locationId: item.locationId || dbItem.locationId,
           qualityStatus: item.qualityStatus || dbItem.qualityStatus
         });
@@ -217,7 +258,9 @@ async function updateAsnItems(id, body, reqUser) {
 }
 
 async function finalizeReceiving(id, reqUser) {
-  const gr = await GoodsReceipt.findByPk(id, { include: ['GoodsReceiptItems'] });
+  const gr = await GoodsReceipt.findByPk(id, {
+    include: [{ association: 'GoodsReceiptItems', include: [{ association: 'Product', attributes: ['id', 'name', 'sku', 'requireBatchTracking', 'perishable'] }] }],
+  });
   if (!gr) throw new Error('ASN not found');
   if (reqUser.role !== 'super_admin' && gr.companyId !== reqUser.companyId) throw new Error('Not authorized');
   if (gr.status === 'completed') throw new Error('Already finalized');
@@ -240,8 +283,14 @@ async function finalizeReceiving(id, reqUser) {
       if (qty <= 0) continue;
 
       if (!gr.warehouseId) throw new Error('Warehouse not specified for this ASN');
-      const product = await Product.findByPk(item.productId, { transaction: t });
+      const product = item.Product || await Product.findByPk(item.productId, { transaction: t });
       if (!product) throw new Error('Product not found');
+      if (requiresBatchTracking(product) && !String(item.batchId || '').trim()) {
+        throw new Error(`${product.name || 'Product'} requires Batch Number because batch tracking is enabled.`);
+      }
+      if (isPerishableProduct(product) && !item.bestBeforeDate) {
+        throw new Error(`${product.name || 'Product'} requires Expiry/Best Before date because product is perishable.`);
+      }
       await validateHeatSensitivePlacement({
         product,
         locationId: item.locationId,

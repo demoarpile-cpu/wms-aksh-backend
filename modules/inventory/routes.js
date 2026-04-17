@@ -12,6 +12,7 @@ const writeRoles = ['super_admin', 'company_admin', 'inventory_manager'];
 const scanRoles = ['super_admin', 'company_admin', 'inventory_manager', 'warehouse_manager', 'picker', 'packer'];
 
 router.get('/products', requireClient, inventoryController.listProducts);
+router.get('/scan/:barcode', requireClient, inventoryController.scanBarcode);
 router.get('/products/:id', requireClient, inventoryController.getProduct);
 router.post('/products', requireAdmin, inventoryController.createProduct);
 router.post('/products/bulk', requireAdmin, inventoryController.bulkCreateProducts);
@@ -25,6 +26,8 @@ router.put('/categories/:id', requireAdmin, inventoryController.updateCategory);
 router.delete('/categories/:id', requireAdmin, inventoryController.removeCategory);
 
 router.get('/stock', requireClient, inventoryController.listStock);
+router.get('/client/:clientId', requireClient, inventoryController.listStockByClient);
+router.get('/bb-date', requireClient, inventoryController.listStockByBestBeforeDate);
 router.get('/stock/by-best-before-date', requireClient, inventoryController.listStockByBestBeforeDate);
 router.get('/stock/by-location', requireClient, inventoryController.listStockByLocation);
 router.post('/stock', requireStaff, inventoryController.createStock);

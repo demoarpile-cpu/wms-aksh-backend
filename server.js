@@ -2,7 +2,15 @@ require('dotenv').config();
 // Restarting to sync bulk import fixes
 const express = require('express');
 const cors = require('cors');
+const fs = require('fs');
 const path = require('path');
+
+const uploadsDir = path.join(__dirname, 'uploads');
+try {
+  if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir, { recursive: true });
+} catch (_) {
+  /* multer may still work if dir exists elsewhere */
+}
 const { sequelize } = require('./models');
 const routes = require('./routes');
 const superadminController = require('./controllers/superadminController');
@@ -36,8 +44,8 @@ app.use(cors({
     callback(null, true);
   },
   credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization']
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'Accept', 'X-Requested-With'],
 }));
 
 app.use(express.json({ limit: '50mb' }));

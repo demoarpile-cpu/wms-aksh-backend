@@ -2,6 +2,29 @@ const { Product, SalesOrder, OrderItem, ProductStock, sequelize } = require('../
 const { Op } = require('sequelize');
 const dayjs = require('dayjs');
 
+/** First displayable image URL or data URL; avoids passing JSON text as img src (causes 431 / huge GET). */
+function firstProductImage(images) {
+    if (images == null || images === '') return null;
+    let list = images;
+    if (typeof images === 'string') {
+        const s = images.trim();
+        if (s.startsWith('http://') || s.startsWith('https://') || s.startsWith('data:image/')) {
+            return s;
+        }
+        try {
+            list = JSON.parse(s);
+        } catch {
+            return null;
+        }
+    }
+    if (!Array.isArray(list) || list.length === 0) return null;
+    const first = list[0];
+    if (typeof first !== 'string') return null;
+    const u = first.trim();
+    if (u.startsWith('http://') || u.startsWith('https://') || u.startsWith('data:image/')) return u;
+    return null;
+}
+
 async function getPredictionData(companyId) {
     // 1. Fetch all active products
     const products = await Product.findAll({
@@ -78,7 +101,7 @@ async function getPredictionData(companyId) {
             id: p.id,
             sku: p.sku,
             name: p.name,
-            image: p.images ? (Array.isArray(p.images) ? p.images[0] : p.images) : null,
+            image: firstProductImage(p.images),
             currentStock,
             totalSoldLast30d: totalSold,
             velocity: Number(velocity.toFixed(2)),

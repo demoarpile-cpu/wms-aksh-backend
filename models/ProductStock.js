@@ -21,6 +21,11 @@ const ProductStock = sequelize.define('ProductStock', {
   tableName: 'product_stocks',
   timestamps: true,
   underscored: true,
+  indexes: [
+    { name: 'idx_product_stocks_client', fields: ['client_id'] },
+    { name: 'idx_product_stocks_product', fields: ['product_id'] },
+    { name: 'idx_product_stocks_warehouse', fields: ['warehouse_id'] },
+  ],
 });
 
 module.exports = ProductStock;

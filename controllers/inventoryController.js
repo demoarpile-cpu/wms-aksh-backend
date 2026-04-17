@@ -9,6 +9,18 @@ async function listProducts(req, res, next) {
   }
 }
 
+async function scanBarcode(req, res, next) {
+  try {
+    const data = await inventoryService.scanBarcode(req.user, req.params.barcode);
+    res.json({ success: true, data });
+  } catch (err) {
+    if (err.message === 'Barcode not found' || err.message === 'Invalid barcode') {
+      return res.status(404).json({ success: false, message: 'Invalid barcode' });
+    }
+    next(err);
+  }
+}
+
 async function getProduct(req, res, next) {
   try {
     const data = await inventoryService.getProductById(req.params.id, req.user);
@@ -115,6 +127,15 @@ async function removeCategory(req, res, next) {
 async function listStock(req, res, next) {
   try {
     const data = await inventoryService.listStock(req.user, req.query);
+    res.json({ success: true, data });
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function listStockByClient(req, res, next) {
+  try {
+    const data = await inventoryService.listStockByClient(req.user, req.params.clientId, req.query);
     res.json({ success: true, data });
   } catch (err) {
     next(err);
@@ -375,13 +396,23 @@ async function transferStock(req, res, next) {
     const data = await inventoryService.transferStock(req.body, req.user);
     res.json({ success: true, data });
   } catch (err) {
-    if (err.message.includes('Insufficient stock')) return res.status(400).json({ success: false, message: err.message });
+    if (
+      err.message.includes('Insufficient stock') ||
+      err.message.includes('required') ||
+      err.message.includes('not found') ||
+      err.message.includes('Invalid source warehouse') ||
+      err.message.includes('Invalid destination warehouse') ||
+      err.message.includes('Source and destination must be different')
+    ) {
+      return res.status(400).json({ success: false, message: err.message });
+    }
     next(err);
   }
 }
 
 module.exports = {
   listProducts,
+  scanBarcode,
   getProduct,
   createProduct,
   bulkCreateProducts,
@@ -393,6 +424,7 @@ module.exports = {
   updateCategory,
   removeCategory,
   listStock,
+  listStockByClient,
   createStock,
   updateStock,
   removeStock,

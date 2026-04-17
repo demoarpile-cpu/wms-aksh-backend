@@ -24,7 +24,12 @@ async function create(req, res, next) {
     const data = await goodsReceiptService.create(req.body, req.user);
     res.status(201).json({ success: true, data });
   } catch (err) {
-    if (err.message === 'Purchase order not found' || err.message === 'Company context required') return res.status(400).json({ success: false, message: err.message });
+    if (
+      err.message === 'Purchase order not found' ||
+      err.message === 'Company context required' ||
+      err.message === 'Warehouse is required for GRN creation' ||
+      err.message === 'Invalid warehouse'
+    ) return res.status(400).json({ success: false, message: err.message });
     if (err.message?.includes('Only approved')) return res.status(400).json({ success: false, message: err.message });
     next(err);
   }
