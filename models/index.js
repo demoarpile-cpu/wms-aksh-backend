@@ -33,6 +33,7 @@ const VatCode = require('./VatCode');
 const Inventory = require('./Inventory');
 const InventoryLog = require('./InventoryLog');
 const SupplierProduct = require('./SupplierProduct');
+const AuditLog = require('./AuditLog');
 
 
 // Company
@@ -70,6 +71,9 @@ Company.hasMany(VatCode, { foreignKey: 'companyId' });
 VatCode.belongsTo(Company, { foreignKey: 'companyId' });
 Company.hasMany(Zone, { foreignKey: 'companyId' });
 Zone.belongsTo(Company, { foreignKey: 'companyId' });
+Company.hasMany(AuditLog, { foreignKey: 'companyId' });
+AuditLog.belongsTo(Company, { foreignKey: 'companyId' });
+AuditLog.belongsTo(User, { foreignKey: 'userId', as: 'User' });
 
 // Product -> Supplier
 Supplier.hasMany(Product, { foreignKey: 'supplierId' });
@@ -271,4 +275,5 @@ module.exports = {
   Inventory,
   InventoryLog,
   SupplierProduct,
+  AuditLog,
 };

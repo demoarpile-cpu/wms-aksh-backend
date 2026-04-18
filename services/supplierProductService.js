@@ -37,6 +37,28 @@ async function findSupplierProductMapping(companyId, supplierId, productId, supp
   });
 }
 
+/**
+ * When forceCreate inserts another row for the same supplier+product, vendor SKU must be unique.
+ * Tries the preferred value first, then "stem (1)", "stem (2)"… Empty preferred uses product-{id} as stem after first collision.
+ */
+async function allocateUniqueSupplierSku(companyId, supplierId, productId, preferredRaw, transaction) {
+  const preferred = String(preferredRaw ?? '').trim();
+  const stem = preferred || `product-${productId}`;
+  for (let suffix = 0; suffix < 5000; suffix += 1) {
+    const candidate = suffix === 0 ? preferred : `${stem} (${suffix})`;
+    const keyForLookup = String(candidate).trim();
+    const existing = await findSupplierProductMapping(
+      companyId,
+      supplierId,
+      productId,
+      keyForLookup,
+      transaction
+    );
+    if (!existing) return keyForLookup;
+  }
+  throw new Error('Could not allocate a unique supplier SKU for this row');
+}
+
 /** Fold header so "Supplier ID", "supplier_id", "SUPPLIERID" all match. */
 function foldHeaderKey(k) {
   return String(k || '')
@@ -387,7 +409,8 @@ function resolveSupplierFromPrefetch(row, suppliers) {
 
 /**
  * Resolve product by product_id and/or internal_sku (sku).
- * When both are set, they must refer to the same product row and SKU must match catalog.
+ * When both are set: product_id wins if it resolves. Internal sku may be a variant label (not in catalog);
+ * we only error if sku maps to a *different* product than product_id.
  */
 function resolveProductWithCrossCheck(row, productById, productBySkuLower) {
   const pidRaw = row.productId;
@@ -402,22 +425,25 @@ function resolveProductWithCrossCheck(row, productById, productBySkuLower) {
     if (!byId && !bySku) {
       return { product: null, error: `product id ${pid} and internal_sku "${sku}" not found for this company` };
     }
-    if (byId && String(byId.sku).toLowerCase() !== sku.toLowerCase()) {
-      return {
-        product: null,
-        error: `internal_sku "${sku}" does not match product_id ${pid} (catalog sku is "${byId.sku}")`,
-      };
+    if (byId) {
+      if (bySku && bySku.id !== byId.id) {
+        return {
+          product: null,
+          error: `internal_sku "${sku}" maps to product ${bySku.id}, which conflicts with product_id ${pid}`,
+        };
+      }
+      return { product: byId, error: null };
     }
-    if (bySku && bySku.id !== pid) {
-      return {
-        product: null,
-        error: `internal_sku "${sku}" belongs to product ${bySku.id}, not product_id ${pid}`,
-      };
+    if (bySku) {
+      if (Number(bySku.id) !== pid) {
+        return {
+          product: null,
+          error: `product id ${pid} not found; internal_sku "${sku}" maps to product ${bySku.id} instead`,
+        };
+      }
+      return { product: bySku, error: null };
     }
-    if (byId && bySku && byId.id !== bySku.id) {
-      return { product: null, error: 'product_id and internal_sku refer to different products' };
-    }
-    return { product: byId || bySku, error: null };
+    return { product: null, error: `product id ${pid} not found for this company` };
   }
 
   if (hasPid && !Number.isNaN(pid) && pid > 0) {
@@ -432,28 +458,30 @@ function resolveProductWithCrossCheck(row, productById, productBySkuLower) {
   return { product: null, error: 'set product_id or internal_sku (sku)' };
 }
 
-async function applyValidatedMappingRow(validated, companyId, transaction) {
+async function applyValidatedMappingRow(validated, companyId, transaction, options = {}) {
+  const forceCreate = Boolean(options.forceCreate);
   const { row, supplier, product } = validated;
   const effectiveDate = parseEffectiveDate(row.effectiveDate);
   if (row.effectiveDate != null && String(row.effectiveDate).trim() !== '' && effectiveDate === null) {
     throw new Error('invalid effectiveDate (use YYYY-MM-DD or leave blank)');
   }
   const supplierSkuNorm = String(row.supplierSku ?? '').trim();
-  let entry = await findSupplierProductMapping(
-    companyId,
-    supplier.id,
-    product.id,
-    supplierSkuNorm,
-    transaction
-  );
   let wasCreate = false;
-  if (!entry) {
+
+  if (forceCreate) {
+    const uniqueSku = await allocateUniqueSupplierSku(
+      companyId,
+      supplier.id,
+      product.id,
+      supplierSkuNorm,
+      transaction
+    );
     await SupplierProduct.create(
       {
         companyId,
         supplierId: supplier.id,
         productId: product.id,
-        supplierSku: supplierSkuNorm || null,
+        supplierSku: uniqueSku ? uniqueSku : null,
         supplierProductName: row.supplierProductName || product.name,
         packSize: Number(row.packSize) || 1,
         costPrice: Number(row.costPrice) || 0,
@@ -463,16 +491,40 @@ async function applyValidatedMappingRow(validated, companyId, transaction) {
     );
     wasCreate = true;
   } else {
-    await entry.update(
-      {
-        supplierSku: supplierSkuNorm || entry.supplierSku,
-        supplierProductName: row.supplierProductName || entry.supplierProductName,
-        packSize: Number(row.packSize) || entry.packSize,
-        costPrice: Number(row.costPrice) || entry.costPrice,
-        effectiveDate: effectiveDate !== null ? effectiveDate : entry.effectiveDate,
-      },
-      { transaction }
+    let entry = await findSupplierProductMapping(
+      companyId,
+      supplier.id,
+      product.id,
+      supplierSkuNorm,
+      transaction
     );
+    if (!entry) {
+      await SupplierProduct.create(
+        {
+          companyId,
+          supplierId: supplier.id,
+          productId: product.id,
+          supplierSku: supplierSkuNorm || null,
+          supplierProductName: row.supplierProductName || product.name,
+          packSize: Number(row.packSize) || 1,
+          costPrice: Number(row.costPrice) || 0,
+          effectiveDate: effectiveDate,
+        },
+        { transaction }
+      );
+      wasCreate = true;
+    } else {
+      await entry.update(
+        {
+          supplierSku: supplierSkuNorm || entry.supplierSku,
+          supplierProductName: row.supplierProductName || entry.supplierProductName,
+          packSize: Number(row.packSize) || entry.packSize,
+          costPrice: Number(row.costPrice) || entry.costPrice,
+          effectiveDate: effectiveDate !== null ? effectiveDate : entry.effectiveDate,
+        },
+        { transaction }
+      );
+    }
   }
 
   const productUpdates = {};
@@ -491,9 +543,11 @@ async function applyValidatedMappingRow(validated, companyId, transaction) {
  * @param {object} reqUser Authenticated user (company scope)
  * @param {object} [options]
  * @param {number} [options.chunkSize=250] Rows per DB transaction (MySQL batch)
+ * @param {boolean} [options.forceCreate] If true, never update existing mappings — insert every row (unique supplierSku allocated if needed).
  */
 async function bulkUpload(mappings, reqUser, options = {}) {
   const chunkSize = Math.max(1, Math.min(Number(options.chunkSize) || DEFAULT_BULK_CHUNK_SIZE, 2000));
+  const forceCreate = Boolean(options.forceCreate);
   const results = {
     created: 0,
     updated: 0,
@@ -637,9 +691,10 @@ async function bulkUpload(mappings, reqUser, options = {}) {
     let c = 0;
     let u = 0;
     const pids = new Set();
+    const rowOpts = { forceCreate };
     await sequelize.transaction(async (transaction) => {
       for (const vr of chunk) {
-        const wasCreate = await applyValidatedMappingRow(vr, companyId, transaction);
+        const wasCreate = await applyValidatedMappingRow(vr, companyId, transaction, rowOpts);
         if (wasCreate) c += 1;
         else u += 1;
         pids.add(vr.product.id);
@@ -660,7 +715,7 @@ async function bulkUpload(mappings, reqUser, options = {}) {
           let c = 0;
           let u = 0;
           await sequelize.transaction(async (transaction) => {
-            const wasCreate = await applyValidatedMappingRow(vr, companyId, transaction);
+            const wasCreate = await applyValidatedMappingRow(vr, companyId, transaction, { forceCreate });
             if (wasCreate) c = 1;
             else u = 1;
           });
@@ -703,6 +758,7 @@ async function bulkUpload(mappings, reqUser, options = {}) {
   }
 
   results.skipSummary = summarizeBulkSkips(results.errors, results.emptySkipped);
+  results.importMode = forceCreate ? 'forceCreate' : 'upsert';
   return results;
 }
 

@@ -4,6 +4,7 @@ const { sequelize } = require('../config/db');
 const GoodsReceipt = sequelize.define('GoodsReceipt', {
   id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
   companyId: { type: DataTypes.INTEGER, allowNull: false },
+  clientId: { type: DataTypes.INTEGER, allowNull: true },
   purchaseOrderId: { type: DataTypes.INTEGER, allowNull: false },
   grNumber: { type: DataTypes.STRING, allowNull: false },
   status: {

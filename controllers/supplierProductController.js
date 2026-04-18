@@ -3,6 +3,16 @@ const supplierProductService = require('../services/supplierProductService');
 const csv = require('csv-parser');
 const fs = require('fs');
 
+/** Query string or multipart field: forceCreate / createNew */
+function parseForceCreate(req) {
+  const raw = String(
+    req.query?.forceCreate ?? req.query?.createNew ?? req.body?.forceCreate ?? req.body?.createNew ?? ''
+  )
+    .toLowerCase()
+    .trim();
+  return raw === '1' || raw === 'true' || raw === 'yes';
+}
+
 function readFileAsUtf8String(filePath) {
   const buf = fs.readFileSync(filePath);
   // UTF-16 LE BOM (common on Windows)
@@ -358,8 +368,10 @@ async function bulkUpload(req, res, next) {
 
     try {
       const chunkSize = req.query.chunkSize != null ? Number(req.query.chunkSize) : undefined;
+      const forceCreate = parseForceCreate(req);
       const results = await supplierProductService.bulkUpload(rows, req.user, {
         chunkSize: Number.isFinite(chunkSize) && chunkSize > 0 ? chunkSize : undefined,
+        forceCreate,
       });
       const headerKeys = rows[0]
         ? Object.keys(rows[0]).map((k) => String(k).replace(/\r/g, '').trim())
@@ -401,8 +413,10 @@ async function bulkUpload(req, res, next) {
         ? body.data
         : [];
     const chunkSize = req.query.chunkSize != null ? Number(req.query.chunkSize) : undefined;
+    const forceCreate = parseForceCreate(req);
     const results = await supplierProductService.bulkUpload(mappings, req.user, {
       chunkSize: Number.isFinite(chunkSize) && chunkSize > 0 ? chunkSize : undefined,
+      forceCreate,
     });
     if (mappings.length && mappings[0] && typeof mappings[0] === 'object') {
       results.importDiagnostics = {

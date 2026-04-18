@@ -1,19 +1,6 @@
-const { GoodsReceipt, GoodsReceiptItem, PurchaseOrder, PurchaseOrderItem, Supplier, Product, ProductStock, Warehouse } = require('../models');
-const { validateHeatSensitivePlacement } = require('./inventoryService');
-
-function isTruthyYes(value) {
-  const normalized = String(value == null ? '' : value).trim().toLowerCase();
-  if (!normalized) return false;
-  return normalized === 'yes' || normalized === 'true' || normalized === '1' || normalized === 'y' || normalized === 'on';
-}
-
-function requiresBatchTracking(product) {
-  return isTruthyYes(product?.requireBatchTracking);
-}
-
-function isPerishableProduct(product) {
-  return isTruthyYes(product?.isPerishable) || isTruthyYes(product?.perishable);
-}
+const { Op } = require('sequelize');
+const { GoodsReceipt, GoodsReceiptItem, PurchaseOrder, PurchaseOrderItem, Supplier, Product, ProductStock, Warehouse, Location, Batch } = require('../models');
+const auditLogService = require('./auditLogService');
 
 async function list(reqUser, query = {}) {
   const where = {};
@@ -23,6 +10,11 @@ async function list(reqUser, query = {}) {
     where.companyId = reqUser.companyId;
   }
   if (query.status) where.status = query.status;
+  if (reqUser.clientId) {
+    where.clientId = reqUser.clientId;
+  } else if (query.clientId) {
+    where.clientId = query.clientId;
+  }
 
   const receipts = await GoodsReceipt.findAll({
     where,
@@ -30,7 +22,7 @@ async function list(reqUser, query = {}) {
     include: [
       { association: 'PurchaseOrder', include: [{ association: 'Supplier', attributes: ['id', 'name'] }] },
       { association: 'Warehouse', attributes: ['id', 'name', 'code'] },
-      { association: 'GoodsReceiptItems', include: [{ association: 'Product', attributes: ['id', 'name', 'sku', 'requireBatchTracking', 'perishable'] }] },
+      { association: 'GoodsReceiptItems', include: [{ association: 'Product', attributes: ['id', 'name', 'sku'] }] },
     ],
   });
   applyGrnDisplayNormalization(receipts);
@@ -62,11 +54,12 @@ async function getById(id, reqUser) {
     include: [
       { association: 'PurchaseOrder', include: ['Supplier'] },
       { association: 'Warehouse', attributes: ['id', 'name', 'code'] },
-      { association: 'GoodsReceiptItems', include: [{ association: 'Product', attributes: ['id', 'name', 'sku', 'requireBatchTracking', 'perishable'] }] },
+      { association: 'GoodsReceiptItems', include: ['Product'] },
     ],
   });
   if (!gr) throw new Error('Goods receipt not found');
   if (reqUser.role !== 'super_admin' && gr.companyId !== reqUser.companyId) throw new Error('Goods receipt not found');
+  if (reqUser.clientId && gr.clientId !== reqUser.clientId) throw new Error('Not authorized to access this client data');
   if (/^GRN-\d+-\d+$/i.test((gr.grNumber || '').trim())) {
     const all = await GoodsReceipt.findAll({ where: { companyId: gr.companyId }, order: [['createdAt', 'ASC']] });
     applyGrnDisplayNormalization(all);
@@ -86,15 +79,6 @@ async function create(body, reqUser) {
   if (!po || po.companyId !== companyId) throw new Error('Purchase order not found');
   if ((po.status || '').toLowerCase() !== 'approved') throw new Error('Only approved purchase orders can be received');
 
-  const warehouseId = Number(body.warehouseId);
-  if (!Number.isFinite(warehouseId) || warehouseId <= 0) {
-    throw new Error('Warehouse is required for GRN creation');
-  }
-  const warehouse = await Warehouse.findByPk(warehouseId);
-  if (!warehouse || warehouse.companyId !== companyId) {
-    throw new Error('Invalid warehouse');
-  }
-
   // GRN number format: GRN001, GRN002, GRN003, ... (sequential per company)
   const all = await GoodsReceipt.findAll({ where: { companyId }, attributes: ['grNumber'], raw: true });
   const existingNums = all.map((r) => (r.grNumber || '').match(/^GRN(\d+)$/i)).filter(Boolean).map((m) => parseInt(m[1], 10));
@@ -104,9 +88,10 @@ async function create(body, reqUser) {
   const totalExpected = (po.PurchaseOrderItems || []).reduce((s, i) => s + (Number(i.quantity) || 0), 0);
 
   const gr = await GoodsReceipt.create({
-    companyId,
+    companyId: po.companyId,
     purchaseOrderId: po.id,
-    warehouseId,
+    clientId: po.clientId || null,
+    warehouseId: po.warehouseId || body.warehouseId || null,
     grNumber,
     status: 'pending',
     notes: body.notes || null,
@@ -122,7 +107,6 @@ async function create(body, reqUser) {
     expectedQty: Number(i.quantity) || 0,
     receivedQty: 0,
     qualityStatus: null,
-    unitCost: Number(i.unitPrice) || null,
   }));
   if (items.length) await GoodsReceiptItem.bulkCreate(items);
 
@@ -130,100 +114,84 @@ async function create(body, reqUser) {
 }
 
 async function updateReceived(id, body, reqUser) {
-  const gr = await GoodsReceipt.findByPk(id, { include: ['GoodsReceiptItems'] });
-  if (!gr) throw new Error('Goods receipt not found');
-  if (reqUser.role !== 'super_admin' && gr.companyId !== reqUser.companyId) throw new Error('Goods receipt not found');
-  if (gr.status === 'completed') throw new Error('Receipt already completed');
+  const t = await GoodsReceipt.sequelize.transaction();
+  try {
+    const gr = await GoodsReceipt.findByPk(id, { 
+      include: ['GoodsReceiptItems'],
+      transaction: t,
+      lock: t.LOCK.UPDATE 
+    });
+    if (!gr) throw new Error('Goods receipt not found');
+    if (reqUser.role !== 'super_admin' && gr.companyId !== reqUser.companyId) throw new Error('Goods receipt not found');
+    if (gr.status === 'completed') throw new Error('Receipt already completed');
 
-  // Keep old values to compute delta for stock update (partial receive should also update stock)
-  const oldByProduct = {};
-  (gr.GoodsReceiptItems || []).forEach((l) => {
-    oldByProduct[l.productId] = { receivedQty: Number(l.receivedQty) || 0, qualityStatus: (l.qualityStatus || '').toUpperCase() };
-  });
+    const po = await PurchaseOrder.findByPk(gr.purchaseOrderId, {
+      include: ['PurchaseOrderItems'],
+      transaction: t,
+      lock: t.LOCK.UPDATE
+    });
 
-  const items = body.items || [];
-  for (const row of items) {
-    const line = gr.GoodsReceiptItems?.find((i) => i.productId === row.productId || i.id === row.id);
-    if (line) {
-      const receivedQty = Number(row.receivedQty) ?? line.receivedQty;
-      await line.update({ receivedQty, qualityStatus: row.qualityStatus || line.qualityStatus });
-    }
-  }
-  const updated = await GoodsReceipt.findByPk(gr.id, { include: ['GoodsReceiptItems'] });
-  const newTotal = (updated.GoodsReceiptItems || []).reduce((s, i) => s + (Number(i.receivedQty) || 0), 0);
-  const allReceived = (updated.GoodsReceiptItems || []).every((i) => (Number(i.receivedQty) || 0) >= (Number(i.expectedQty) || 0));
-  await updated.update({
-    totalReceived: newTotal,
-    status: allReceived ? 'completed' : 'in_progress',
-  });
-
-  // Add received quantity (delta) to stock — existing inventory record update karo, naya sirf jab koi record na ho.
-  const companyWarehouses = await Warehouse.findAll({ where: { companyId: updated.companyId }, attributes: ['id'], order: [['id', 'ASC']] });
-  const warehouseIds = (companyWarehouses || []).map((w) => w.id);
-  const defaultWarehouseId = warehouseIds.length > 0 ? warehouseIds[0] : null;
-  let stockUpdated = false;
-  let stockWarning = null;
-  if (!defaultWarehouseId && (updated.GoodsReceiptItems || []).some((i) => (Number(i.receivedQty) || 0) > 0)) {
-    stockWarning = 'No warehouse found. Create a warehouse (Warehouses → Add Warehouse) to update inventory stock.';
-  }
-  if (warehouseIds.length > 0 && (updated.GoodsReceiptItems || []).length > 0) {
-    const warehouseService = require('./warehouseService');
-    for (const line of updated.GoodsReceiptItems) {
-      const pid = Number(line.productId) || line.productId;
-      const newReceived = Number(line.receivedQty) || 0;
-      const old = oldByProduct[pid] || oldByProduct[line.productId] || { receivedQty: 0, qualityStatus: '' };
-      const delta = newReceived - (Number(old.receivedQty) || 0);
-      if (delta <= 0) continue;
-      const quality = (line.qualityStatus || '').toUpperCase();
-      const qtyToAdd = quality === 'DAMAGED' ? 0 : delta;
-      if (qtyToAdd <= 0) continue;
-
-      const whId = gr.warehouseId || defaultWarehouseId;
-      if (whId) {
-        await warehouseService.validateCapacity(whId, qtyToAdd);
-      }
-
-      try {
-        // Pehle is product ka koi existing stock record dhoondo (company ke kisi bhi warehouse me) — naya record mat banao jab tak existing na mile
-        let stock = await ProductStock.findOne({
-          where: { productId: pid, warehouseId: whId },
-        });
-        if (stock) {
-          await stock.update({ quantity: (Number(stock.quantity) || 0) + qtyToAdd });
-        } else {
-          await ProductStock.create({
-            productId: pid,
-            warehouseId: whId,
-            quantity: qtyToAdd,
-            reserved: 0,
-            status: 'ACTIVE',
+    const items = body.items || [];
+    for (const row of items) {
+      const line = gr.GoodsReceiptItems?.find((i) => i.productId === row.productId || i.id === row.id);
+      if (line) {
+        const newReceivedQty = Number(row.receivedQty) || 0;
+        
+        // Over-receive validation
+        const poItem = po.PurchaseOrderItems.find(p => p.productId === line.productId);
+        if (poItem) {
+          // Check other finalized GRNs
+          const otherGrItems = await GoodsReceiptItem.findAll({
+            include: [{ association: 'GoodsReceipt', where: { purchaseOrderId: po.id, status: 'completed', id: { [Op.ne]: id } } }],
+            where: { productId: line.productId },
+            transaction: t
           });
+          const alreadyReceived = otherGrItems.reduce((sum, gi) => sum + (Number(gi.receivedQty) || 0), 0);
+          if ((alreadyReceived + newReceivedQty) > Number(poItem.quantity)) {
+            throw new Error(`Over-receiving detected for SKU ${line.productSku}. Ordered: ${poItem.quantity}, Already finalized: ${alreadyReceived}, Attempting to set this ASN to: ${newReceivedQty}.`);
+          }
         }
-        stockUpdated = true;
-      } catch (err) {
-        stockWarning = (stockWarning ? stockWarning + ' ' : '') + (err.message || 'Stock update failed.');
+
+        await line.update({ 
+          receivedQty: newReceivedQty, 
+          qualityStatus: row.qualityStatus || line.qualityStatus 
+        }, { transaction: t });
       }
     }
-  }
 
-  const result = await getById(gr.id, reqUser);
-  const plain = result.get ? result.get({ plain: true }) : (result.toJSON ? result.toJSON() : result);
-  return { ...plain, stockUpdated: !!stockUpdated, stockWarning: stockWarning || undefined };
+    const newTotal = (gr.GoodsReceiptItems || []).reduce((s, i) => s + (Number(i.receivedQty) || 0), 0);
+    const allReceived = (gr.GoodsReceiptItems || []).every((i) => (Number(i.receivedQty) || 0) >= (Number(i.expectedQty) || 0));
+    
+    await gr.update({
+      totalReceived: newTotal,
+      status: allReceived ? 'completed' : 'in_progress',
+    }, { transaction: t });
+
+    await auditLogService.logAction(reqUser, {
+      action: 'GRN_RECEIVED_PARTIAL',
+      module: 'INBOUND',
+      referenceId: gr.id,
+      referenceNumber: gr.grNumber,
+      details: { totalReceived: newTotal }
+    });
+
+    await t.commit();
+    return getById(gr.id, reqUser);
+  } catch (err) {
+    if (t) await t.rollback();
+    throw err;
+  }
 }
 
 async function updateAsnItems(id, body, reqUser) {
-  const gr = await GoodsReceipt.findByPk(id, {
-    include: [{ association: 'GoodsReceiptItems', include: [{ association: 'Product', attributes: ['id', 'name', 'sku', 'requireBatchTracking', 'perishable'] }] }],
-  });
+  const gr = await GoodsReceipt.findByPk(id, { include: ['GoodsReceiptItems'] });
   if (!gr) throw new Error('ASN not found');
   if (reqUser.role !== 'super_admin' && gr.companyId !== reqUser.companyId) throw new Error('Not authorized');
 
   if (body.deliveryType) gr.deliveryType = body.deliveryType;
   if (body.eta) gr.eta = body.eta;
   if (body.warehouseId) {
-    const wh = await Warehouse.findByPk(body.warehouseId);
-    if (!wh || wh.companyId !== gr.companyId) throw new Error('Invalid warehouse');
-    gr.warehouseId = body.warehouseId;
+    gr.warehouseId = Number(body.warehouseId);
   }
   await gr.save();
 
@@ -231,22 +199,10 @@ async function updateAsnItems(id, body, reqUser) {
     for (const item of body.items) {
       const dbItem = gr.GoodsReceiptItems.find(i => i.id === item.id);
       if (dbItem) {
-        const product = dbItem.Product || (await Product.findByPk(dbItem.productId));
-        const qtyToBook = item.qtyToBook ?? dbItem.qtyToBook;
-        const batchVal = item.batchId ?? dbItem.batchId ?? null;
-        const bbdVal = item.bestBeforeDate ?? dbItem.bestBeforeDate ?? null;
-        if (Number(qtyToBook) > 0) {
-          if (requiresBatchTracking(product) && !String(batchVal || '').trim()) {
-            throw new Error(`${product?.name || dbItem.productName || 'Product'} requires Batch Number because batch tracking is enabled.`);
-          }
-          if (isPerishableProduct(product) && !bbdVal) {
-            throw new Error(`${product?.name || dbItem.productName || 'Product'} requires Expiry/Best Before date because product is perishable.`);
-          }
-        }
         await dbItem.update({
-          batchId: requiresBatchTracking(product) ? batchVal : null,
-          bestBeforeDate: isPerishableProduct(product) ? bbdVal : null,
-          qtyToBook,
+          batchId: item.batchId || dbItem.batchId,
+          bestBeforeDate: item.bestBeforeDate || dbItem.bestBeforeDate,
+          qtyToBook: item.qtyToBook ?? dbItem.qtyToBook,
           locationId: item.locationId || dbItem.locationId,
           qualityStatus: item.qualityStatus || dbItem.qualityStatus
         });
@@ -258,86 +214,159 @@ async function updateAsnItems(id, body, reqUser) {
 }
 
 async function finalizeReceiving(id, reqUser) {
-  const gr = await GoodsReceipt.findByPk(id, {
-    include: [{ association: 'GoodsReceiptItems', include: [{ association: 'Product', attributes: ['id', 'name', 'sku', 'requireBatchTracking', 'perishable'] }] }],
-  });
-  if (!gr) throw new Error('ASN not found');
-  if (reqUser.role !== 'super_admin' && gr.companyId !== reqUser.companyId) throw new Error('Not authorized');
-  if (gr.status === 'completed') throw new Error('Already finalized');
-
-  // Transaction for stock booking
+  // 1. Start Transaction
   const t = await GoodsReceipt.sequelize.transaction();
+  
   try {
-    // Look up PO items to get unitPrice for unitCost recording
-    const poItems = gr.purchaseOrderId ? await PurchaseOrderItem.findAll({
-      where: { purchaseOrderId: gr.purchaseOrderId },
+    // 2. Fetch and Lock GRN
+    const gr = await GoodsReceipt.findByPk(id, { 
+      include: ['GoodsReceiptItems'],
       transaction: t,
-    }) : [];
-    const poItemsByProduct = {};
-    for (const pi of poItems) {
-      poItemsByProduct[pi.productId] = pi;
-    }
+      lock: t.LOCK.UPDATE
+    });
 
+    if (!gr) throw new Error('ASN not found');
+    if (reqUser.role !== 'super_admin' && gr.companyId !== reqUser.companyId) throw new Error('Not authorized');
+    if (gr.status === 'completed') throw new Error('Already finalized');
+    if (!gr.warehouseId) throw new Error('Warehouse not specified. Please set a destination warehouse.');
+
+    // 3. Fetch and Lock Purchase Order to prevent concurrent receiving edits
+    const po = await PurchaseOrder.findByPk(gr.purchaseOrderId, {
+      include: [{ association: 'PurchaseOrderItems' }],
+      transaction: t,
+      lock: t.LOCK.UPDATE
+    });
+    if (!po) throw new Error('Linked Purchase Order not found');
+
+    // 4. Validate and Process each item
     for (const item of gr.GoodsReceiptItems) {
-      const qty = Number(item.qtyToBook) || 0;
-      if (qty <= 0) continue;
+      const qtyToBook = Number(item.qtyToBook) || 0;
+      if (qtyToBook <= 0) continue;
 
-      if (!gr.warehouseId) throw new Error('Warehouse not specified for this ASN');
-      const product = item.Product || await Product.findByPk(item.productId, { transaction: t });
-      if (!product) throw new Error('Product not found');
-      if (requiresBatchTracking(product) && !String(item.batchId || '').trim()) {
-        throw new Error(`${product.name || 'Product'} requires Batch Number because batch tracking is enabled.`);
-      }
-      if (isPerishableProduct(product) && !item.bestBeforeDate) {
-        throw new Error(`${product.name || 'Product'} requires Expiry/Best Before date because product is perishable.`);
-      }
-      await validateHeatSensitivePlacement({
-        product,
-        locationId: item.locationId,
-        actionLabel: 'received',
-        transaction: t,
+      // Check for over-receiving against PO line
+      const poItem = po.PurchaseOrderItems.find(p => p.productId === item.productId);
+      if (!poItem) throw new Error(`Product ${item.productSku} not found in original Purchase Order`);
+
+      // Calculate what has been received so far in other finalized GRNs
+      const otherGrItems = await GoodsReceiptItem.findAll({
+        include: [{ 
+          association: 'GoodsReceipt', 
+          where: { 
+            purchaseOrderId: po.id, 
+            status: 'completed',
+            id: { [Op.ne]: id }
+          } 
+        }],
+        where: { productId: item.productId },
+        transaction: t
       });
+      const alreadyReceived = otherGrItems.reduce((sum, gi) => sum + (Number(gi.receivedQty) || 0), 0);
+      const remainingAllowed = Number(poItem.quantity) - alreadyReceived;
 
-      // Record unitCost from PO line item (for FIFO layer tracking)
-      const poItem = poItemsByProduct[item.productId];
-      const unitCost = item.unitCost || (poItem ? (Number(poItem.unitPrice) || null) : null);
+      if (qtyToBook > remainingAllowed) {
+        throw new Error(`Over-receiving detected for ${item.productSku}. Ordered: ${poItem.quantity}, Already Received: ${alreadyReceived}, Attempting: ${qtyToBook}. Maximum allowed now: ${remainingAllowed}`);
+      }
 
-      // Add to ProductStock
+      // 5. Heat Sensitivity & Location Validation
+      const product = await Product.findByPk(item.productId, { transaction: t });
+      const isHeatSensitive = ['yes', 'true', '1'].includes(String(product?.heatSensitive || '').toLowerCase());
+      if (isHeatSensitive) {
+        if (!item.locationId) throw new Error(`Heat-sensitive product "${product.name}" requires a specific location.`);
+        const location = await Location.findByPk(item.locationId, { transaction: t });
+        const locHeatSafe = ['yes', 'true', '1'].includes(String(location?.heatSensitive || '').toLowerCase());
+        if (!locHeatSafe) throw new Error(`Location ${location?.name} is not suitable for heat-sensitive product "${product.name}"`);
+      }
+
+      // 6. Manage Batch (if applicable)
+      if (item.batchId) {
+        // Prevent duplicate batch for same product in same GRN
+        const existingBatch = await Batch.findOne({
+          where: { productId: item.productId, batchNumber: item.batchId, grnId: id },
+          transaction: t
+        });
+        if (existingBatch) throw new Error(`Duplicate batch ${item.batchId} for product ${item.productSku} in this GRN`);
+
+        await Batch.create({
+          companyId: gr.companyId,
+          clientId: gr.clientId || null,
+          productId: item.productId,
+          warehouseId: gr.warehouseId,
+          locationId: item.locationId || null,
+          batchNumber: item.batchId,
+          quantity: qtyToBook,
+          expiryDate: item.bestBeforeDate || null,
+          grnId: id,
+          status: 'ACTIVE'
+        }, { transaction: t });
+      }
+
+      // 7. Update Inventory (with row locking check)
       let stock = await ProductStock.findOne({
         where: { 
           productId: item.productId, 
           warehouseId: gr.warehouseId,
+          companyId: gr.companyId,
           locationId: item.locationId || null
         },
-        transaction: t
+        transaction: t,
+        lock: t.LOCK.UPDATE
       });
 
       if (stock) {
-        await stock.update({ quantity: (Number(stock.quantity) || 0) + qty }, { transaction: t });
+        await stock.update({ quantity: (Number(stock.quantity) || 0) + qtyToBook }, { transaction: t });
       } else {
         await ProductStock.create({
+          companyId: gr.companyId,
+          clientId: gr.clientId || null,
           productId: item.productId,
           warehouseId: gr.warehouseId,
           locationId: item.locationId || null,
-          quantity: qty,
+          quantity: qtyToBook,
           reserved: 0,
           status: 'ACTIVE'
         }, { transaction: t });
       }
-      
-      // Update item received qty and unitCost
-      await item.update({ receivedQty: qty, unitCost: unitCost }, { transaction: t });
+
+      // Update item record
+      await item.update({ receivedQty: qtyToBook }, { transaction: t });
     }
 
+    // 8. Finalize GRN status
+    const totalReceivedNow = (gr.GoodsReceiptItems || []).reduce((s, i) => s + (Number(i.qtyToBook) || 0), 0);
     await gr.update({ 
       status: 'completed',
-      totalReceived: (gr.GoodsReceiptItems || []).reduce((s, i) => s + (Number(i.qtyToBook) || 0), 0)
+      totalReceived: totalReceivedNow
     }, { transaction: t });
+
+    // 9. Auto-Check PO completion
+    const allGrItemsForPo = await GoodsReceiptItem.findAll({
+      include: [{ association: 'GoodsReceipt', where: { purchaseOrderId: po.id, status: 'completed' } }],
+      transaction: t
+    });
+    const poTotals = {};
+    allGrItemsForPo.forEach(gi => {
+      poTotals[gi.productId] = (poTotals[gi.productId] || 0) + (Number(gi.receivedQty) || 0);
+    });
+    const isPoFullyReceived = po.PurchaseOrderItems.every(poi => (poTotals[poi.productId] || 0) >= Number(poi.quantity));
+    if (isPoFullyReceived) {
+      await po.update({ status: 'received' }, { transaction: t });
+    }
+
+    // 10. Audit Log
+    await auditLogService.logAction(reqUser, {
+      action: 'GRN_FINALIZED',
+      module: 'INBOUND',
+      referenceId: gr.id,
+      referenceNumber: gr.grNumber,
+      details: { totalItems: gr.GoodsReceiptItems.length, totalReceived: totalReceivedNow }
+    });
 
     await t.commit();
     return getById(id, reqUser);
+
   } catch (err) {
-    await t.rollback();
+    if (t) await t.rollback();
+    console.error('Finalize Failed:', err);
     throw err;
   }
 }

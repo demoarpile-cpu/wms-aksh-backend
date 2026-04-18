@@ -3,6 +3,7 @@ const { sequelize } = require('../config/db');
 
 const ProductStock = sequelize.define('ProductStock', {
   id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
+  companyId: { type: DataTypes.INTEGER, allowNull: false },
   productId: { type: DataTypes.INTEGER, allowNull: false },
   warehouseId: { type: DataTypes.INTEGER, allowNull: false },
   locationId: { type: DataTypes.INTEGER, allowNull: true },

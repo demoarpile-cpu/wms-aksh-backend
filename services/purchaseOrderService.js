@@ -1,6 +1,7 @@
 const { PurchaseOrder, PurchaseOrderItem, Supplier, Product, SupplierProduct } = require('../models');
 const { Op } = require('sequelize');
 const PDFDocument = require('pdfkit');
+const auditLogService = require('./auditLogService');
 
 async function list(reqUser, query = {}) {
   const where = {};
@@ -10,6 +11,11 @@ async function list(reqUser, query = {}) {
     where.companyId = reqUser.companyId;
   }
   if (query.status) where.status = query.status;
+  if (reqUser.clientId) {
+    where.clientId = reqUser.clientId;
+  } else if (query.clientId) {
+    where.clientId = query.clientId;
+  }
 
   const pos = await PurchaseOrder.findAll({
     where,
@@ -35,6 +41,7 @@ async function getById(id, reqUser) {
   });
   if (!po) throw new Error('Purchase order not found');
   if (reqUser.role !== 'super_admin' && po.companyId !== reqUser.companyId) throw new Error('Purchase order not found');
+  if (reqUser.clientId && po.clientId !== reqUser.clientId) throw new Error('Not authorized to access this client data');
   return po;
 }
 
@@ -97,12 +104,21 @@ async function create(body, reqUser) {
     status: (body.status || 'pending').toLowerCase(),
     totalAmount,
     expectedDelivery: body.expectedDelivery || null,
-    warehouseId: body.warehouseId || null,
+    // Warehouse is set at goods receiving (GRN), not at PO creation.
+    warehouseId: null,
     notes: body.notes || null,
   });
 
   const items = resolvedItems.map((i) => ({ ...i, purchaseOrderId: po.id }));
   if (items.length) await PurchaseOrderItem.bulkCreate(items);
+
+  await auditLogService.logAction(reqUser, {
+    action: 'PO_CREATED',
+    module: 'INBOUND',
+    referenceId: po.id,
+    referenceNumber: po.poNumber,
+    details: { totalAmount: po.totalAmount, itemCount: items.length }
+  });
 
   return getById(po.id, reqUser);
 }
@@ -111,10 +127,11 @@ async function update(id, body, reqUser) {
   const po = await PurchaseOrder.findByPk(id);
   if (!po) throw new Error('Purchase order not found');
   if (reqUser.role !== 'super_admin' && po.companyId !== reqUser.companyId) throw new Error('Purchase order not found');
+  if (reqUser.clientId && po.clientId !== reqUser.clientId) throw new Error('Not authorized to access this client data');
   if (po.status !== 'pending' && po.status !== 'draft') throw new Error('Only pending/draft PO can be updated');
 
   if (body.supplierId != null) po.supplierId = body.supplierId;
-  if (body.clientId != null) po.clientId = body.clientId;
+  if (body.clientId !== undefined) po.clientId = body.clientId;
   if (body.expectedDelivery != null) po.expectedDelivery = body.expectedDelivery;
   // Warehouse is intentionally assigned at GRN stage, not PO stage.
   if (body.notes != null) po.notes = body.notes;
@@ -139,6 +156,14 @@ async function update(id, body, reqUser) {
   } else {
     await po.save();
   }
+
+  await auditLogService.logAction(reqUser, {
+    action: 'PO_UPDATED',
+    module: 'INBOUND',
+    referenceId: po.id,
+    referenceNumber: po.poNumber
+  });
+
   return getById(id, reqUser);
 }
 
@@ -146,6 +171,7 @@ async function approve(id, body, reqUser) {
   const po = await PurchaseOrder.findByPk(id, { include: ['PurchaseOrderItems'] });
   if (!po) throw new Error('Purchase order not found');
   if (reqUser.role !== 'super_admin' && po.companyId !== reqUser.companyId) throw new Error('Purchase order not found');
+  if (reqUser.clientId && po.clientId !== reqUser.clientId) throw new Error('Not authorized to access this client data');
   if (po.status !== 'pending' && po.status !== 'draft') throw new Error('Only pending/draft PO can be approved/rejected');
 
   const action = String(body.action || 'approve').toLowerCase();
@@ -174,6 +200,14 @@ async function approve(id, body, reqUser) {
     eta: body.expectedDeliveryDate || body.expectedDelivery || po.expectedDelivery,
     notes: body.notes || `Auto ASN generated on approval for ${po.poNumber}`,
   }, reqUser);
+
+  await auditLogService.logAction(reqUser, {
+    action: action === 'reject' ? 'PO_REJECTED' : 'PO_APPROVED',
+    module: 'INBOUND',
+    referenceId: po.id,
+    referenceNumber: po.poNumber
+  });
+
   return getById(id, reqUser);
 }
 
@@ -205,6 +239,7 @@ async function generateAsn(id, body, reqUser) {
   const gr = await GoodsReceipt.create({
     companyId: po.companyId,
     purchaseOrderId: po.id,
+    clientId: po.clientId || null,
     // Warehouse is selected during GRN/asn receiving flow.
     warehouseId: body.warehouseId || null,
     deliveryType: body.deliveryType || 'carton',
@@ -237,12 +272,18 @@ function mapCsvRow(row) {
     const key = String(k || '').trim().toLowerCase().replace(/[\s_-]+/g, '');
     folded[key] = typeof v === 'string' ? v.trim() : v;
   }
-  const finalQtyRaw = folded.finalquantity ?? folded.emptyquantity ?? folded.quantity ?? folded.confirmedquantity;
+  const finalQtyRaw =
+    folded.finalquantity ??
+    folded.emptyquantity ??
+    folded.quantity ??
+    folded.confirmedquantity ??
+    folded.editablequantity ??
+    folded.editableqty;
   const suggestedQtyRaw = folded.suggestedquantity ?? folded.suggestedqty;
   return {
     productId: Number(folded.productid || folded.id) || 0,
     sku: String(folded.sku || '').trim(),
-    productName: String(folded.productname || '').trim(),
+    productName: String(folded.productname || folded.product || '').trim(),
     finalQuantity: Number(finalQtyRaw) || 0,
     suggestedQuantity: Number(suggestedQtyRaw) || 0,
   };
@@ -251,8 +292,17 @@ function mapCsvRow(row) {
 function validateCsvHeaders(rows) {
   const first = rows[0] || {};
   const keys = Object.keys(first).map((k) => String(k || '').trim().toLowerCase().replace(/[\s_-]+/g, ''));
-  const hasIdentity = ['productid', 'sku', 'productname'].some((k) => keys.includes(k));
-  const hasQty = ['finalquantity', 'emptyquantity', 'suggestedquantity', 'quantity', 'confirmedquantity'].some((k) => keys.includes(k));
+  const hasIdentity = ['productid', 'sku', 'productname', 'product'].some((k) => keys.includes(k));
+  const hasQty = [
+    'finalquantity',
+    'emptyquantity',
+    'suggestedquantity',
+    'suggestedqty',
+    'quantity',
+    'confirmedquantity',
+    'editablequantity',
+    'editableqty',
+  ].some((k) => keys.includes(k));
   if (!hasIdentity || !hasQty) {
     throw new Error('Invalid CSV headers. Required: Product ID or SKU or Product Name, and Final Quantity or Suggested Quantity.');
   }

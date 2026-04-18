@@ -36,124 +36,17 @@ function normalizeProductJson(p) {
   return out;
 }
 
-function normalizeBarcode(value) {
-  return String(value == null ? '' : value).trim().toLowerCase();
-}
-
-function canonicalBarcode(value) {
-  const normalized = normalizeBarcode(value).replace(/[^a-z0-9]/g, '');
-  if (!normalized) return '';
-  if (/^\d+$/.test(normalized)) return normalized.replace(/^0+/, '') || '0';
-  return normalized;
-}
-
-function barcodeMatches(inputBarcode, candidate) {
-  const a = normalizeBarcode(inputBarcode);
-  const b = normalizeBarcode(candidate);
-  if (!a || !b) return false;
-  if (a === b) return true;
-  return canonicalBarcode(a) === canonicalBarcode(b);
-}
-
-function parseCartonQuantity(cartonEntry) {
-  const raw =
-    cartonEntry?.quantity ??
-    cartonEntry?.qty ??
-    cartonEntry?.units ??
-    cartonEntry?.packQty ??
-    cartonEntry?.packSize;
-  const parsed = Number(raw);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : 1;
-}
-
-function cartonBarcodeCandidates(cartonEntry) {
-  return [
-    cartonEntry?.barcode,
-    cartonEntry?.cartonBarcode,
-    cartonEntry?.code,
-    cartonEntry?.label,
-    cartonEntry?.ean,
-    cartonEntry?.upc,
-  ]
-    .map(normalizeBarcode)
-    .filter(Boolean);
-}
-
-function productScanCandidates(product) {
-  const candidates = [
-    product?.barcode,
-    product?.sku,
-  ]
-    .map(normalizeBarcode)
-    .filter(Boolean);
-
-  const alt = Array.isArray(product?.alternativeSkus) ? product.alternativeSkus : [];
-  alt.forEach((x) => {
-    if (typeof x === 'string') {
-      const v = normalizeBarcode(x);
-      if (v) candidates.push(v);
-      return;
-    }
-    if (x && typeof x === 'object') {
-      const v = normalizeBarcode(x.sku || x.code || x.barcode || x.value);
-      if (v) candidates.push(v);
-    }
-  });
-  return Array.from(new Set(candidates));
-}
-
 function isTruthyYes(value) {
   const normalized = String(value == null ? '' : value).trim().toLowerCase();
-  if (!normalized) return false;
-  return (
-    normalized === 'yes' ||
-    normalized === 'true' ||
-    normalized === '1' ||
-    normalized === 'y' ||
-    normalized === 'on'
-  );
+  return normalized === 'yes' || normalized === 'true' || normalized === '1';
 }
 
-function productRequiresBatchTracking(product) {
-  if (!product) return false;
-  return isTruthyYes(product.requireBatchTracking);
-}
-
-function productIsPerishable(product) {
-  if (!product) return false;
-  return isTruthyYes(product.isPerishable) || isTruthyYes(product.perishable);
-}
-
-function validateProductBatchAndExpiry({ product, batchNumber, bestBeforeDate, actionLabel }) {
-  if (productRequiresBatchTracking(product) && !String(batchNumber || '').trim()) {
-    throw new Error(`${product.name || 'This product'} requires a Batch Number for ${actionLabel}.`);
-  }
-  if (productIsPerishable(product) && !bestBeforeDate) {
-    throw new Error(`${product.name || 'This product'} requires a Best Before (Expiry) Date for ${actionLabel}.`);
-  }
-}
-
-/** Product flagged heat-sensitive in any common UI/API shape */
-function productIsHeatSensitive(product) {
-  if (!product) return false;
-  if (isTruthyYes(product.heatSensitive)) return true;
-  const s = String(product.heatSensitive ?? '').trim().toLowerCase();
-  return s === 'heat' || s === 'hot' || s.includes('heat-sensitive') || s.includes('heat sensitive');
-}
-
-async function validateHeatSensitivePlacement({ product, locationId, actionLabel, transaction }) {
-  if (!productIsHeatSensitive(product)) return;
-  if (!locationId) {
-    throw new Error(
-      `Heat-sensitive product "${product.name || product.sku || ''}" must have a location selected during ${actionLabel}.`
-    );
-  }
-  const location = await Location.findByPk(locationId, { transaction });
+async function validateHeatSensitivePlacement({ product, locationId, actionLabel }) {
+  if (!locationId || !isTruthyYes(product?.heatSensitive)) return;
+  const location = await Location.findByPk(locationId);
   if (!location) throw new Error('Location not found');
   if (!isTruthyYes(location.heatSensitive)) {
-    throw new Error(
-      `Heat-sensitive product "${product.name || product.sku || ''}" can only be ${actionLabel} into locations marked heat-sensitive (yes). Non–heat-sensitive products may use any location.`
-    );
+    throw new Error(`Heat-sensitive product can only be ${actionLabel} to heat-sensitive locations`);
   }
 }
 
@@ -181,108 +74,6 @@ async function listProducts(reqUser, query = {}) {
     ],
   });
   return products;
-}
-
-async function scanBarcode(reqUser, scannedBarcode) {
-  const barcode = normalizeBarcode(scannedBarcode);
-  if (!barcode) throw new Error('Invalid barcode');
-
-  const where = {};
-  if (reqUser.role !== 'super_admin') where.companyId = reqUser.companyId;
-
-  // 1) Carton-first lookup (stored as JSON under Product.cartons).
-  const cartonProducts = await Product.findAll({
-    where: { ...where, cartons: { [Op.ne]: null } },
-    attributes: ['id', 'name', 'sku', 'barcode', 'cartons', 'alternativeSkus'],
-    order: [['id', 'DESC']],
-  });
-
-  for (const productRow of cartonProducts) {
-    const normalizedProduct = normalizeProductJson(productRow);
-    const cartonEntries = Array.isArray(normalizedProduct.cartons) ? normalizedProduct.cartons : [];
-    const carton = cartonEntries.find((entry) =>
-      cartonBarcodeCandidates(entry).some((candidate) => barcodeMatches(barcode, candidate))
-    );
-    if (!carton) continue;
-
-    const cartonProductId = Number(carton.productId) || Number(normalizedProduct.id);
-    let matchedProduct = normalizedProduct;
-    if (cartonProductId !== Number(normalizedProduct.id)) {
-      const productByCartonId = await Product.findByPk(cartonProductId, {
-        attributes: ['id', 'name', 'sku', 'barcode'],
-      });
-      if (productByCartonId) matchedProduct = productByCartonId.get({ plain: true });
-    }
-
-    return {
-      type: 'carton',
-      barcode: carton.barcode || scannedBarcode,
-      productId: Number(matchedProduct.id),
-      quantity: parseCartonQuantity(carton),
-      carton: {
-        barcode: carton.barcode || scannedBarcode,
-        quantity: parseCartonQuantity(carton),
-      },
-      product: {
-        id: Number(matchedProduct.id),
-        name: matchedProduct.name,
-        sku: matchedProduct.sku,
-        barcode: matchedProduct.barcode || null,
-      },
-    };
-  }
-
-  // 2) Product-level lookup (barcode / SKU / alternative SKU values).
-  const productRows = await Product.findAll({
-    where,
-    attributes: ['id', 'name', 'sku', 'barcode', 'alternativeSkus'],
-    order: [['id', 'DESC']],
-  });
-  const matchedProduct = productRows
-    .map((row) => normalizeProductJson(row))
-    .find((p) => productScanCandidates(p).some((candidate) => barcodeMatches(barcode, candidate)));
-
-  if (matchedProduct) {
-    return {
-      type: 'product',
-      barcode: matchedProduct.barcode || scannedBarcode,
-      productId: Number(matchedProduct.id),
-      quantity: 1,
-      product: {
-        id: Number(matchedProduct.id),
-        name: matchedProduct.name,
-        sku: matchedProduct.sku,
-        barcode: matchedProduct.barcode || null,
-      },
-    };
-  }
-
-  // 3) Last-resort fallback: allow pure numeric scan as product ID.
-  const compact = canonicalBarcode(barcode);
-  const numericId = Number.parseInt(compact, 10);
-  if (Number.isFinite(numericId) && numericId > 0 && String(numericId) === compact) {
-    const productById = await Product.findOne({
-      where: { ...where, id: numericId },
-      attributes: ['id', 'name', 'sku', 'barcode'],
-    });
-    if (productById) {
-      const p = productById.get({ plain: true });
-      return {
-        type: 'product',
-        barcode: p.barcode || scannedBarcode,
-        productId: Number(p.id),
-        quantity: 1,
-        product: {
-          id: Number(p.id),
-          name: p.name,
-          sku: p.sku,
-          barcode: p.barcode || null,
-        },
-      };
-    }
-  }
-
-  throw new Error('Barcode not found');
 }
 
 async function listCategories(reqUser, query = {}) {
@@ -659,161 +450,29 @@ async function removeCategory(id, reqUser) {
 
 async function listStock(reqUser, query = {}) {
   const where = {};
+  if (reqUser.role !== 'super_admin' && reqUser.companyId) {
+    where.companyId = reqUser.companyId;
+  }
+  // Enforce client-level visibility
+  if (reqUser.clientId) {
+    where.clientId = reqUser.clientId;
+  } else if (query.clientId) {
+    where.clientId = query.clientId;
+  }
+  
   if (query.warehouseId) where.warehouseId = query.warehouseId;
   if (query.productId) where.productId = query.productId;
   if (query.locationId) where.locationId = query.locationId;
-  if (query.clientId) where.clientId = query.clientId;
   if (query.batchNumber) where.batchNumber = query.batchNumber;
-  const parsedPage = Number.parseInt(query.page, 10);
-  const parsedLimit = Number.parseInt(query.limit, 10);
-  const page = Number.isFinite(parsedPage) && parsedPage > 0 ? parsedPage : 1;
-  const limit = Number.isFinite(parsedLimit) && parsedLimit > 0 ? parsedLimit : null;
-  const usePagination = limit !== null;
-
-  const productWhere = {};
-  if (reqUser.role !== 'super_admin') productWhere.companyId = reqUser.companyId;
-  if (query.search) {
-    productWhere[Op.or] = [
-      { name: { [Op.like]: `%${query.search}%` } },
-      { sku: { [Op.like]: `%${query.search}%` } },
-      { barcode: { [Op.like]: `%${query.search}%` } },
-    ];
-  }
-
-  const include = [
-    { association: 'Product', where: Object.keys(productWhere).length ? productWhere : undefined, required: Object.keys(productWhere).length > 0 },
-    { association: 'Warehouse', include: ['Company'] },
-    { association: 'Location', required: false },
-    { association: 'Client', attributes: ['id', 'name', 'code'], required: false },
-  ];
-
-  if (usePagination) {
-    const { rows, count } = await ProductStock.findAndCountAll({
-      where,
-      include,
-      distinct: true,
-      order: [['updatedAt', 'DESC']],
-      limit,
-      offset: (page - 1) * limit,
-    });
-    return { rows, total: count, page, limit };
-  }
-
   const stocks = await ProductStock.findAll({
     where,
-    include,
-    order: [['updatedAt', 'DESC']],
+    include: [
+      { association: 'Product', where: reqUser.role !== 'super_admin' ? { companyId: reqUser.companyId } : undefined, required: reqUser.role !== 'super_admin' },
+      { association: 'Warehouse', include: ['Company'] },
+      { association: 'Location', required: false },
+    ],
   });
   return stocks;
-}
-
-async function listStockByClient(reqUser, clientId, query = {}) {
-  const where = { clientId };
-  if (query.warehouseId) where.warehouseId = query.warehouseId;
-  if (query.productId) where.productId = query.productId;
-  if (query.locationId) where.locationId = query.locationId;
-  if (query.batchNumber) where.batchNumber = query.batchNumber;
-
-  const parsedPage = Number.parseInt(query.page, 10);
-  const parsedLimit = Number.parseInt(query.limit, 10);
-  const page = Number.isFinite(parsedPage) && parsedPage > 0 ? parsedPage : 1;
-  const limit = Number.isFinite(parsedLimit) && parsedLimit > 0 ? parsedLimit : null;
-  const usePagination = limit !== null;
-
-  const productWhere = {};
-  if (reqUser.role !== 'super_admin') productWhere.companyId = reqUser.companyId;
-  const search = String(query.search || '').trim().toLowerCase();
-  if (search) {
-    productWhere[Op.or] = [
-      { name: { [Op.like]: `%${search}%` } },
-      { sku: { [Op.like]: `%${search}%` } },
-      { barcode: { [Op.like]: `%${search}%` } },
-    ];
-  }
-
-  const include = [
-    {
-      association: 'Product',
-      where: Object.keys(productWhere).length ? productWhere : undefined,
-      required: true,
-      attributes: ['id', 'name', 'sku', 'barcode'],
-    },
-    { association: 'Warehouse', include: ['Company'], required: false },
-    { association: 'Location', required: false },
-    { association: 'Client', attributes: ['id', 'name', 'code'], required: false },
-  ];
-
-  const stockRows = await ProductStock.findAll({
-    where,
-    include,
-    order: [['updatedAt', 'DESC']],
-  });
-
-  const aggregatedMap = new Map();
-  for (const row of stockRows) {
-    const product = row.Product || row.product;
-    if (!product) continue;
-    const warehouse = row.Warehouse || row.warehouse;
-    const warehouseName = warehouse?.name || '-';
-    const quantity = Number(row.quantity) || 0;
-    const reserved = Number(row.reserved) || 0;
-    const available = Math.max(0, quantity - reserved);
-    const productId = Number(product.id);
-    const key = String(productId);
-
-    // Extra search support on warehouse name (in addition to product filters).
-    if (search) {
-      const nameMatch = String(product.name || '').toLowerCase().includes(search);
-      const skuMatch = String(product.sku || '').toLowerCase().includes(search);
-      const whMatch = String(warehouseName || '').toLowerCase().includes(search);
-      if (!nameMatch && !skuMatch && !whMatch) continue;
-    }
-
-    if (!aggregatedMap.has(key)) {
-      aggregatedMap.set(key, {
-        id: productId,
-        productId,
-        productName: product.name || '-',
-        sku: product.sku || '-',
-        totalQuantity: 0,
-        availableQuantity: 0,
-        warehouseCount: 0,
-        warehouseDetails: [],
-        updatedAt: row.updatedAt,
-      });
-    }
-    const entry = aggregatedMap.get(key);
-    entry.totalQuantity += quantity;
-    entry.availableQuantity += available;
-    if (!entry.updatedAt || new Date(row.updatedAt) > new Date(entry.updatedAt)) {
-      entry.updatedAt = row.updatedAt;
-    }
-    const existingWh = entry.warehouseDetails.find((w) => Number(w.warehouseId) === Number(row.warehouseId || warehouse?.id));
-    if (existingWh) {
-      existingWh.quantity += quantity;
-      existingWh.availableQuantity += available;
-    } else {
-      entry.warehouseDetails.push({
-        warehouseId: row.warehouseId || warehouse?.id || null,
-        warehouseName,
-        quantity,
-        availableQuantity: available,
-      });
-      entry.warehouseCount += 1;
-    }
-  }
-
-  const aggregatedRows = Array.from(aggregatedMap.values()).sort((a, b) =>
-    String(a.productName || '').localeCompare(String(b.productName || ''))
-  );
-
-  if (usePagination) {
-    const start = (page - 1) * limit;
-    const rows = aggregatedRows.slice(start, start + limit);
-    return { rows, total: aggregatedRows.length, page, limit };
-  }
-
-  return aggregatedRows;
 }
 
 async function createStock(data, reqUser) {
@@ -827,11 +486,9 @@ async function createStock(data, reqUser) {
     await warehouseService.validateCapacity(data.warehouseId, data.quantity);
   }
 
-  if ((data.quantity ?? 0) > 0) {
-    await validateHeatSensitivePlacement({ product, locationId: data.locationId, actionLabel: 'booked' });
-  }
-
   const stock = await ProductStock.create({
+    companyId: reqUser.companyId,
+    clientId: reqUser.clientId || data.clientId || null,
     productId: data.productId,
     warehouseId: data.warehouseId,
     locationId: data.locationId || null,
@@ -863,16 +520,6 @@ async function updateStock(stockId, data, reqUser) {
   if (data.quantity !== undefined && data.quantity > stock.quantity) {
     const warehouseService = require('./warehouseService');
     await warehouseService.validateCapacity(stock.warehouseId, data.quantity - stock.quantity);
-  }
-
-  const nextQty = data.quantity !== undefined ? data.quantity : stock.quantity;
-  const nextLoc = data.locationId !== undefined ? data.locationId : stock.locationId;
-  if ((nextQty ?? 0) > 0) {
-    await validateHeatSensitivePlacement({
-      product: stock.Product,
-      locationId: nextLoc,
-      actionLabel: 'held in',
-    });
   }
 
   await stock.update({
@@ -924,14 +571,11 @@ async function listStockByBestBeforeDate(reqUser, query = {}) {
     const key = `${s.productId}-${s.bestBeforeDate || 'no-date'}-${s.batchNumber || 'no-batch'}-${s.warehouseId || '0'}-${s.locationId || '0'}`;
     if (!byKey[key]) {
       byKey[key] = {
-        aggregateKey: key,
         productId: s.productId,
         productName: s.Product?.name,
         productSku: s.Product?.sku,
         bestBeforeDate: s.bestBeforeDate,
         batchNumber: s.batchNumber,
-        warehouseId: s.warehouseId,
-        locationId: s.locationId,
         warehouseName: s.Warehouse?.name || '—',
         locationName: locName,
         totalAvailable: 0,
@@ -1028,18 +672,7 @@ async function listAdjustments(reqUser, query = {}) {
 
 async function createAdjustment(data, reqUser) {
   const role = (reqUser.role || '').toString().toLowerCase().replace(/-/g, '_');
-  const allowedRoles = [
-    'super_admin',
-    'company_admin',
-    'admin',
-    'manager',
-    'inventory_manager',
-    'warehouse_manager',
-    'warehouse_staff',
-    'staff',
-    'picker',
-    'packer',
-  ];
+  const allowedRoles = ['super_admin', 'company_admin', 'inventory_manager', 'warehouse_manager', 'picker', 'packer'];
   if (!allowedRoles.includes(role)) {
     throw new Error('Not allowed to create adjustment');
   }
@@ -1050,12 +683,12 @@ async function createAdjustment(data, reqUser) {
   const product = await Product.findByPk(data.productId);
   if (!product) throw new Error('Product not found');
   if (effectiveCompanyId && product.companyId !== effectiveCompanyId && role !== 'super_admin') throw new Error('Product not found');
-  validateProductBatchAndExpiry({
-    product,
-    batchNumber: data.batchNumber,
-    bestBeforeDate: data.bestBeforeDate,
-    actionLabel: 'accurate tracking',
-  });
+  if (!String(data.batchNumber || '').trim()) {
+    throw new Error(`${product.name || 'This product'} requires a Batch Number for accurate tracking`);
+  }
+  if (!data.bestBeforeDate) {
+    throw new Error(`${product.name || 'This product'} requires a Best Before (Expiry) Date`);
+  }
 
   // Auto-detect type from quantity sign if not explicitly provided
   const rawQty = parseInt(data.quantity, 10) || 0;
@@ -1825,12 +1458,12 @@ async function stockIn(data, reqUser) {
   if (!product) throw new Error('Product not found');
   if (reqUser.role !== 'super_admin' && product.companyId !== reqUser.companyId) throw new Error('Product not found');
 
-  validateProductBatchAndExpiry({
-    product,
-    batchNumber,
-    bestBeforeDate,
-    actionLabel: 'stock in',
-  });
+  if (!String(batchNumber || '').trim()) {
+    throw new Error(`${product.name || 'This product'} requires a Batch Number for accurate tracking`);
+  }
+  if (!bestBeforeDate) {
+    throw new Error(`${product.name || 'This product'} requires a Best Before (Expiry) Date`);
+  }
   await validateHeatSensitivePlacement({ product, locationId, actionLabel: 'booked' });
 
   // 1. Sync Warehouse Level Total
@@ -1841,13 +1474,12 @@ async function stockIn(data, reqUser) {
   await inventory.increment('quantity', { by: quantity });
 
   // 2. Sync Granular Stock (Batch + Location)
-  const normalizedBatchNumber = String(batchNumber || '').trim() || null;
   const [stock] = await ProductStock.findOrCreate({
     where: { 
       productId, 
       warehouseId, 
       locationId: locationId || null, 
-      batchNumber: normalizedBatchNumber,
+      batchNumber: batchNumber.trim(),
       clientId: clientId || null
     },
     defaults: {
@@ -1871,7 +1503,7 @@ async function stockIn(data, reqUser) {
     type: 'IN',
     quantity,
     referenceId: referenceId || 'SCAN_IN',
-    batchNumber: normalizedBatchNumber,
+    batchNumber: batchNumber.trim(),
     bestBeforeDate,
     reason: reason || 'Scan In',
     userId: reqUser.id
@@ -1906,16 +1538,11 @@ async function stockOut(data, reqUser) {
 }
 
 async function transferStock(data, reqUser) {
-  const { ProductStock, InventoryLog, Warehouse, sequelize } = require('../models');
+  const { ProductStock, InventoryLog, sequelize } = require('../models');
   const { productId, fromLocationId, toLocationId, clientId, quantity, batchNumber, bestBeforeDate, reason } = data;
   
   const fromWarehouseId = data.fromWarehouseId || data.warehouseId;
   const toWarehouseId = data.toWarehouseId || fromWarehouseId;
-
-  if (!fromWarehouseId) throw new Error('Source warehouse is required');
-  if (!toWarehouseId) throw new Error('Destination warehouse is required');
-  if (!fromLocationId) throw new Error('Source location is required');
-  if (!toLocationId) throw new Error('Destination location is required');
 
   if (fromLocationId === toLocationId && fromWarehouseId === toWarehouseId) {
     throw new Error('Source and destination must be different');
@@ -1926,22 +1553,12 @@ async function transferStock(data, reqUser) {
   const product = await Product.findByPk(productId);
   if (!product) throw new Error('Product not found');
   if (reqUser.role !== 'super_admin' && product.companyId !== reqUser.companyId) throw new Error('Product not found');
-
-  const sourceWarehouse = await Warehouse.findByPk(fromWarehouseId);
-  const destinationWarehouse = await Warehouse.findByPk(toWarehouseId);
-  if (!sourceWarehouse) throw new Error('Source warehouse not found');
-  if (!destinationWarehouse) throw new Error('Destination warehouse not found');
-  if (reqUser.role !== 'super_admin') {
-    if (sourceWarehouse.companyId !== reqUser.companyId) throw new Error('Invalid source warehouse');
-    if (destinationWarehouse.companyId !== reqUser.companyId) throw new Error('Invalid destination warehouse');
+  if (!String(batchNumber || '').trim()) {
+    throw new Error(`${product.name || 'This product'} requires a Batch Number for this transfer`);
   }
-
-  validateProductBatchAndExpiry({
-    product,
-    batchNumber,
-    bestBeforeDate,
-    actionLabel: 'this transfer',
-  });
+  if (!bestBeforeDate) {
+    throw new Error(`${product.name || 'This product'} requires a Best Before (Expiry) Date for this transfer`);
+  }
   await validateHeatSensitivePlacement({ product, locationId: toLocationId, actionLabel: 'transferred' });
   
   return sequelize.transaction(async (t) => {
@@ -2131,7 +1748,6 @@ async function transfer(data, reqUser) {
 
 module.exports = {
   listProducts,
-  scanBarcode,
   listCategories,
   getProductById,
   createProduct,
@@ -2143,7 +1759,6 @@ module.exports = {
   updateCategory,
   removeCategory,
   listStock,
-  listStockByClient,
   createStock,
   updateStock,
   removeStock,
@@ -2170,6 +1785,4 @@ module.exports = {
   stockOut,
   transfer,
   transferStock,
-  validateHeatSensitivePlacement,
-  productIsHeatSensitive,
 };
