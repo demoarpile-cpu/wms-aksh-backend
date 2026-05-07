@@ -67,7 +67,8 @@ app.get('/api/dashboard/:type', authenticate, requireRole(...dashboardRoles), (r
   const type = (req.params.type || '').toLowerCase();
   if (type === 'stats') return dashboardController.stats(req, res, next);
   if (type === 'charts') return dashboardController.charts(req, res, next);
-  res.status(404).json({ success: false, message: 'Not found. Use /api/dashboard/stats or /api/dashboard/charts' });
+  if (type === 'notifications') return dashboardController.notifications(req, res, next);
+  res.status(404).json({ success: false, message: 'Not found. Use /api/dashboard/stats, /api/dashboard/charts or /api/dashboard/notifications' });
 });
 app.get('/api/reports', authenticate, requireRole(...dashboardRoles), reportController.list);
 app.get('/api/reports/:id', authenticate, requireRole(...dashboardRoles), reportController.getById);

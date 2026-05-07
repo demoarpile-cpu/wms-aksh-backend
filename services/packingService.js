@@ -128,7 +128,9 @@ async function completePacking(id, reqUser) {
 
     // Deduct Stock for each order item
     if (task.SalesOrder && task.SalesOrder.OrderItems) {
+      console.log(`[DEBUG_PACKING] Processing ${task.SalesOrder.OrderItems.length} items for task ${id}`);
       for (const item of task.SalesOrder.OrderItems) {
+        console.log(`[DEBUG_PACKING] Shipping Product: ${item.productId}, Qty: ${item.quantity}, WH: ${task.PickList?.warehouseId}, Company: ${task.SalesOrder.companyId}`);
         await inventoryService.shipStock({
           productId: item.productId,
           companyId: task.SalesOrder.companyId,

@@ -2021,6 +2021,7 @@ async function shipStock(data, t) {
   }
 
   // 1. Find stock rows. Prioritize rows with reservations for this client/product.
+  console.log(`[DEBUG_STOCK] Searching stock for Product: ${productId}, WH: ${warehouseId}, Company: ${companyId}`);
   const stockRows = await ProductStock.findAll({
     where: {
       productId,
@@ -2038,6 +2039,18 @@ async function shipStock(data, t) {
   });
 
   const totalAvailable = stockRows.reduce((sum, row) => sum + Number(row.quantity), 0);
+  console.log(`[DEBUG_STOCK] Found ${stockRows.length} rows for this company. Total Physical: ${totalAvailable}, Requested: ${quantity}`);
+
+  if (stockRows.length === 0) {
+    const allWhRows = await ProductStock.findAll({ where: { productId, quantity: { [Op.gt]: 0 } }, transaction: t });
+    if (allWhRows.length > 0) {
+      const locations = allWhRows.map(r => `WH:${r.warehouseId}(Qty:${r.quantity})`).join(', ');
+      console.log(`[DEBUG_STOCK] Product ${productId} found in OTHER warehouses: ${locations}`);
+    } else {
+      console.log(`[DEBUG_STOCK] Product ${productId} NOT FOUND in ANY warehouse.`);
+    }
+  }
+
   if (totalAvailable < quantity) {
     throw new Error(`Insufficient physical stock for shipment. Requested: ${quantity}, Total Physical: ${totalAvailable}`);
   }
