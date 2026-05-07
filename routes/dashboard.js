@@ -7,5 +7,6 @@ const dashboardRoles = ['super_admin', 'company_admin', 'warehouse_manager', 'in
 
 router.get('/stats', authenticate, requireRole(...dashboardRoles), dashboardController.stats);
 router.get('/charts', authenticate, requireRole(...dashboardRoles), dashboardController.charts);
+router.get('/notifications', authenticate, requireRole(...dashboardRoles), dashboardController.notifications);
 
 module.exports = router;

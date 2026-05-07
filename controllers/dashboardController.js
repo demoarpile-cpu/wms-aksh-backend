@@ -147,6 +147,16 @@ async function stats(req, res, next) {
       }
     }
 
+    // Picker/Packer specific stats
+    let ordersPickedToday = 0;
+    let ordersPackedToday = 0;
+    if (user.role === 'picker') {
+      ordersPickedToday = await PickList.count({ where: { assignedTo: user.id, status: 'PICKED', updatedAt: { [Op.gte]: todayStart } } });
+    }
+    if (user.role === 'packer') {
+      ordersPackedToday = await PackingTask.count({ where: { assignedTo: user.id, status: 'PACKED', updatedAt: { [Op.gte]: todayStart } } });
+    }
+
     res.json({
       success: true,
       data: {
@@ -158,9 +168,11 @@ async function stats(req, res, next) {
         completedOrdersToday: counts[5],
         totalStock,
         lowStockCount,
-        pickingPendingCount: counts[6],
-        packingPendingCount: counts[7],
+        pickingPendingCount: user.role === 'picker' ? await PickList.count({ where: { assignedTo: user.id, status: { [Op.in]: ['NOT_STARTED', 'ASSIGNED', 'PARTIALLY_PICKED'] } } }) : counts[6],
+        packingPendingCount: user.role === 'packer' ? await PackingTask.count({ where: { assignedTo: user.id, status: { [Op.in]: ['NOT_STARTED', 'ASSIGNED', 'PACKING'] } } }) : counts[7],
         movementsToday: counts[8],
+        ordersPickedToday,
+        ordersPackedToday,
         utilization,
         staffPerformance
       },
@@ -409,4 +421,88 @@ async function reports(req, res, next) {
   }
 }
 
-module.exports = { stats, charts, reports };
+/**
+ * GET /api/dashboard/notifications
+ * Returns role-specific dynamic notifications
+ */
+async function notifications(req, res, next) {
+  try {
+    const user = req.user;
+    const companyId = user.companyId || null;
+    const todayStart = new Date();
+    todayStart.setHours(0, 0, 0, 0);
+
+    const alerts = [];
+
+    if (user.role === 'super_admin') {
+      const planRequests = await Company.count({ where: { status: 'PENDING' } });
+      if (planRequests > 0) {
+        alerts.push({ id: 'plan-req', title: 'Plan Requests', message: `${planRequests} companies awaiting approval.`, type: 'info', link: '/companies' });
+      }
+    }
+
+    if (companyId) {
+      // Common for admin/manager/inventory
+      if (['company_admin', 'inventory_manager', 'warehouse_manager'].includes(user.role)) {
+        // Low Stock
+        const products = await Product.findAll({ where: { companyId, status: 'ACTIVE' }, attributes: ['id', 'name', 'reorderLevel'] });
+        const whs = await Warehouse.findAll({ where: { companyId }, attributes: ['id'] });
+        const whIds = whs.map(w => w.id);
+        
+        let lowStockCount = 0;
+        for (const p of products) {
+          const sum = await ProductStock.sum('quantity', { where: { productId: p.id, warehouseId: { [Op.in]: whIds } } });
+          if ((sum || 0) < (p.reorderLevel || 0)) lowStockCount++;
+        }
+        if (lowStockCount > 0) {
+          alerts.push({ id: 'low-stock', title: 'Low Stock Alert', message: `${lowStockCount} items are below reorder level.`, type: 'warning', link: '/inventory' });
+        }
+      }
+
+      if (user.role === 'warehouse_manager' || user.role === 'company_admin') {
+        const pendingPicks = await PickList.count({ 
+          where: { status: 'pending' },
+          include: [{ association: 'SalesOrder', where: { companyId }, attributes: [] }]
+        });
+        if (pendingPicks > 0) {
+          alerts.push({ id: 'pending-picks', title: 'Unassigned Picks', message: `${pendingPicks} picking tasks need assignment.`, type: 'error', link: '/picking' });
+        }
+        
+        const pendingPacks = await PackingTask.count({ 
+          where: { status: 'pending' },
+          include: [{ association: 'SalesOrder', where: { companyId }, attributes: [] }]
+        });
+        if (pendingPacks > 0) {
+          alerts.push({ id: 'pending-packs', title: 'Pending Packing', message: `${pendingPacks} packing tasks are awaiting fulfillment.`, type: 'info', link: '/packing' });
+        }
+      }
+
+      if (user.role === 'picker') {
+        const myPicks = await PickList.count({ where: { assignedTo: user.id, status: { [Op.in]: ['pending', 'in_progress'] } } });
+        if (myPicks > 0) {
+          alerts.push({ id: 'my-picks', title: 'New Assignments', message: `You have ${myPicks} picking tasks assigned to you.`, type: 'success', link: '/picking' });
+        }
+      }
+
+      if (user.role === 'packer') {
+        const myPacks = await PackingTask.count({ where: { assignedTo: user.id, status: { [Op.in]: ['pending', 'packing'] } } });
+        if (myPacks > 0) {
+          alerts.push({ id: 'my-packs', title: 'New Assignments', message: `You have ${myPacks} packing tasks assigned to you.`, type: 'success', link: '/packing' });
+        }
+      }
+      
+      if (user.role === 'inventory_manager') {
+        const pendingPOs = await SalesOrder.count({ where: { companyId, status: 'pending' } });
+        if (pendingPOs > 0) {
+          alerts.push({ id: 'pending-orders', title: 'New Orders', message: `${pendingPOs} new orders received today.`, type: 'info', link: '/sales-orders' });
+        }
+      }
+    }
+
+    res.json({ success: true, data: alerts });
+  } catch (err) {
+    next(err);
+  }
+}
+
+module.exports = { stats, charts, reports, notifications };
