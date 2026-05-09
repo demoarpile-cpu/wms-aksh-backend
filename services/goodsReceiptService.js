@@ -280,13 +280,10 @@ async function finalizeReceiving(id, reqUser) {
       const poItem = po.PurchaseOrderItems.find(p => p.productId === item.productId);
       if (!poItem) throw new Error(`Product ${item.productSku} not found in original Purchase Order`);
 
-      // 4.2 Heat-Sensitive Check
+      // 4.2 Heat-Sensitive Check (Relaxed to allow booking if location is selected)
       if (isTruthyYes(product.heatSensitive)) {
         if (!item.locationId) throw new Error(`Location is required for heat-sensitive product "${product.name}"`);
-        const loc = await Location.findByPk(item.locationId, { transaction: t });
-        if (!loc || !isTruthyYes(loc.heatSensitive)) {
-          throw new Error(`${item.productName}: Location ${loc?.name || item.locationId} is not a heat-sensitive location. Hot products must be booked into Hot Locations.`);
-        }
+        // Note: Strict hot-zone validation removed to allow operational flexibility.
       }
 
       // Calculate what has been received so far in other finalized GRNs
@@ -437,13 +434,17 @@ async function finalizeReceiving(id, reqUser) {
 }
 
 async function exportCsvTemplate(id, reqUser) {
-  const gr = await GoodsReceipt.findByPk(id, { include: ['GoodsReceiptItems'] });
+  const gr = await GoodsReceipt.findByPk(id, { 
+    include: [{ association: 'GoodsReceiptItems', include: ['Product'] }] 
+  });
   if (!gr) throw new Error('Goods receipt not found');
   if (reqUser.role !== 'super_admin' && gr.companyId !== reqUser.companyId) throw new Error('Not authorized');
 
-  let csv = 'SKU,Expected Qty (Each),Best Before Date (DD/MM/YYYY),Batch Number\n';
+  let csv = 'Internal SKU,SKU,Product,Expected Qty (Each),Best Before Date (DD/MM/YYYY),Batch Number\n';
   (gr.GoodsReceiptItems || []).forEach(item => {
-    csv += `${item.productSku},${Number(item.expectedQty).toString()},,\n`;
+    const internalSku = item.Product?.sku || item.productSku || '';
+    const productName = item.productName || item.Product?.name || '';
+    csv += `"${internalSku}","${item.productSku}","${productName}",${Number(item.expectedQty).toString()},,\n`;
   });
   return { csv, filename: `Template_${gr.grNumber}.csv` };
 }

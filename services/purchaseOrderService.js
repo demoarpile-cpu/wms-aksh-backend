@@ -301,6 +301,8 @@ function mapCsvRow(row) {
     folded.finalquantity ??
     folded.emptyquantity ??
     folded.quantity ??
+    folded.qty ??
+    folded.orderqty ??
     folded.confirmedquantity ??
     folded.editablequantity ??
     folded.editableqty;
@@ -324,6 +326,8 @@ function validateCsvHeaders(rows) {
     'suggestedquantity',
     'suggestedqty',
     'quantity',
+    'qty',
+    'orderqty',
     'confirmedquantity',
     'editablequantity',
     'editableqty',
@@ -490,9 +494,9 @@ async function generatePoPdf(id, reqUser) {
 
     try {
       let finalUrl = headerImageUrl;
-      // Force JPG + Auto Quality + Resize to 500px width (Fixes buffer crashes)
+      // Force JPG + Auto Quality + Resize to 1200px width for banners
       if (finalUrl.includes('cloudinary.com') && finalUrl.includes('/upload/')) {
-        finalUrl = finalUrl.replace('/upload/', '/upload/f_jpg,q_auto,w_500/');
+        finalUrl = finalUrl.replace('/upload/', '/upload/f_jpg,q_auto,w_1200/');
       }
       
       const separator = finalUrl.includes('?') ? '&' : '?';
@@ -509,16 +513,21 @@ async function generatePoPdf(id, reqUser) {
       });
       
       const buffer = Buffer.from(new Uint8Array(response.data));
-      
-      // Save to disk first - this is the most stable way for PDFKit
       fs.writeFileSync(tempFilePath, buffer);
 
       if (fs.existsSync(tempFilePath)) {
-        // Reduced size for the logo
-        doc.image(tempFilePath, 40, 15, { fit: [100, 50] });
-        logoLoaded = true;
+        if (po.Client?.header_image_url) {
+          // If it's a professional client header, render as a banner but limited height to avoid overlap
+          doc.image(tempFilePath, 40, 15, { fit: [515, 70] });
+          logoLoaded = true;
+          currentY = 95; 
+        } else {
+          // Fallback company logo
+          doc.image(tempFilePath, 40, 15, { fit: [120, 60] });
+          logoLoaded = true;
+          currentY = 85;
+        }
         
-        // Clean up later
         doc.on('end', () => {
           try { if (fs.existsSync(tempFilePath)) fs.unlinkSync(tempFilePath); } catch (e) {}
         });
@@ -529,17 +538,19 @@ async function generatePoPdf(id, reqUser) {
     }
   }
 
-  // --- COMPANY INFO ON TOP-RIGHT ---
-  doc.fontSize(12).font('Helvetica-Bold').fillColor('#333333');
-  doc.text(company?.name || '', 300, 20, { align: 'right', width: 255 });
-  doc.fontSize(9).font('Helvetica').fillColor('#666666');
-  doc.text(company?.address || '', 300, doc.y, { align: 'right', width: 255 });
-  if (company?.phone || company?.email) {
-    doc.text(`${company?.phone || ''} ${company?.email ? '| ' + company?.email : ''}`, 300, doc.y, { align: 'right', width: 255 });
+  // --- COMPANY INFO ON TOP-RIGHT (Only if NOT using client banner) ---
+  if (!po.Client?.header_image_url) {
+    doc.fontSize(12).font('Helvetica-Bold').fillColor('#333333');
+    doc.text(company?.name || '', 300, 20, { align: 'right', width: 255 });
+    doc.fontSize(9).font('Helvetica').fillColor('#666666');
+    doc.text(company?.address || '', 300, doc.y, { align: 'right', width: 255 });
+    if (company?.phone || company?.email) {
+      doc.text(`${company?.phone || ''} ${company?.email ? '| ' + company?.email : ''}`, 300, doc.y, { align: 'right', width: 255 });
+    }
   }
 
   // Ensure plenty of gap below the logo and company info
-  currentY = Math.max(105, doc.y + 20);
+  currentY = Math.max(logoLoaded ? (po.Client?.header_image_url ? 110 : 105) : 80, doc.y + 20);
 
   // Clean separator line
   doc.moveTo(40, currentY).lineTo(555, currentY).strokeColor('#eeeeee').lineWidth(1).stroke();
