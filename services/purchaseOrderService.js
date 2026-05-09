@@ -34,7 +34,7 @@ async function getById(id, reqUser) {
   const po = await PurchaseOrder.findByPk(id, {
     include: [
       { association: 'Supplier' },
-      { association: 'Client', attributes: ['id', 'name'] },
+      { association: 'Client', attributes: ['id', 'name', 'header_image_url'] },
       { association: 'Warehouse', attributes: ['id', 'name', 'code'] },
       { association: 'PurchaseOrderItems', include: ['Product'] },
     ],
@@ -475,8 +475,8 @@ async function generatePoPdf(id, reqUser) {
   doc.on('data', (d) => buffers.push(d));
 
   // --- HEADER SECTION ---
-  // Priority: Company branding logo (Standardized for all POs)
-  let headerImageUrl = company?.header_image_url;
+  // Priority: 1. Client-specific professional header, 2. Company branding logo
+  let headerImageUrl = po.Client?.header_image_url || company?.header_image_url;
 
   let logoLoaded = false;
   let currentY = 40;
