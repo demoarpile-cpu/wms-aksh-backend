@@ -8,6 +8,10 @@ function normalizeProductJson(p) {
   if (typeof out.cartons === 'string') {
     try { out.cartons = JSON.parse(out.cartons); } catch (_) { out.cartons = null; }
   }
+  // Handle legacy single-object carton format
+  if (out.cartons != null && !Array.isArray(out.cartons) && typeof out.cartons === 'object') {
+    out.cartons = [out.cartons];
+  }
   if (out.cartons != null && !Array.isArray(out.cartons)) out.cartons = null;
   if (typeof out.supplierProducts === 'string') {
     try { out.supplierProducts = JSON.parse(out.supplierProducts); } catch (_) { out.supplierProducts = null; }
@@ -53,6 +57,7 @@ async function validateHeatSensitivePlacement({ product, locationId, actionLabel
 async function scanBarcode(reqUser, barcode) {
   if (!barcode) throw new Error('Invalid barcode');
   const cleanBarcode = barcode.trim();
+  const lowerBarcode = cleanBarcode.toLowerCase();
 
   const where = {
     [Op.or]: [
@@ -65,6 +70,7 @@ async function scanBarcode(reqUser, barcode) {
     where.companyId = reqUser.companyId;
   }
 
+  // 1. Try direct product match
   const product = await Product.findOne({
     where,
     include: [
@@ -78,12 +84,56 @@ async function scanBarcode(reqUser, barcode) {
           { association: 'Location' }
         ]
       },
-      { association: 'Batches' } // Batch belongs to Product, not ProductStock
+      { association: 'Batches' }
     ]
   });
 
-  if (!product) throw new Error('Barcode or SKU not found');
-  return normalizeProductJson(product);
+  if (product) {
+    const normalized = normalizeProductJson(product);
+    return { ...normalized, type: 'product', quantity: 1 };
+  }
+
+  // 2. If not found, search in cartons JSON
+  // For performance, we fetch products for this company and check cartons in memory
+  // In a very large DB, this would need a native JSON query
+  const compWhere = reqUser.role !== 'super_admin' ? { companyId: reqUser.companyId } : {};
+  const allProducts = await Product.findAll({ where: compWhere });
+
+  for (const p of allProducts) {
+    const normalizedP = normalizeProductJson(p);
+    const cartons = normalizedP.cartons;
+    if (Array.isArray(cartons)) {
+      const match = cartons.find(c => String(c.barcode || '').trim().toLowerCase() === lowerBarcode);
+      if (match) {
+        // Fetch full product details for the match
+        const fullProduct = await Product.findByPk(p.id, {
+          include: [
+            { association: 'Category' },
+            { association: 'Company' },
+            { association: 'Supplier' },
+            {
+              association: 'ProductStocks',
+              include: [
+                { association: 'Warehouse' },
+                { association: 'Location' }
+              ]
+            },
+            { association: 'Batches' }
+          ]
+        });
+        const normalizedFull = normalizeProductJson(fullProduct);
+        // Robustly get quantity from various possible field names
+        const qty = match.quantity ?? match.caseSize ?? match.unitsPerCarton ?? 1;
+        return { 
+          ...normalizedFull, 
+          type: 'carton', 
+          quantity: Math.max(1, Number(qty) || 1) 
+        };
+      }
+    }
+  }
+
+  throw new Error('Barcode not found');
 }
 
 async function listProducts(reqUser, query = {}) {

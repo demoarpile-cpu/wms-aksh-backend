@@ -42,8 +42,12 @@ async function scanBarcode(req, res, next) {
     res.json({ success: true, data });
   } catch (err) {
     console.error("[SCAN] Error for:", req.params.barcode, "->", err.message);
-    if (err.message === 'Barcode not found' || err.message === 'Invalid barcode') {
-      return res.status(404).json({ success: false, message: 'Invalid barcode' });
+    const isNotFound = 
+      err.message.toLowerCase().includes('not found') || 
+      err.message === 'Invalid barcode';
+      
+    if (isNotFound) {
+      return res.status(404).json({ success: false, message: 'Barcode not found', barcode: req.params.barcode });
     }
     next(err);
   }
