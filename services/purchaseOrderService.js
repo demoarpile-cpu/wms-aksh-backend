@@ -76,14 +76,15 @@ async function create(body, reqUser) {
         const effDate = entry.effectiveDate ? new Date(entry.effectiveDate).toISOString().slice(0, 10) : null;
         // Only use prices effective on or before the PO delivery/creation date
         if (!effDate || effDate <= priceDate) {
-          const packSize = Number(entry.packSize) || 1;
-          unitPrice = (Number(entry.costPrice) || 0) / packSize;
+          const ps = Number(entry.packSize) || 1;
+          // Mapping costPrice is CASE COST, so unitPrice (single) is costPrice / ps
+          unitPrice = (Number(entry.costPrice) || 0) / ps;
           break;
         }
       }
     }
     const packSize = Number(i.packSize) || 1;
-    const totalPrice = (Number(i.quantity) || 0) * (unitPrice * packSize);
+    const totalPrice = (Number(i.quantity) || 0) * unitPrice;
 
     resolvedItems.push({
       purchaseOrderId: null, // set below after PO creation
@@ -200,10 +201,16 @@ async function approve(id, body, reqUser) {
       if (!idNum) continue;
       const confirmedQty = Number(item.confirmedQuantity);
       if (!Number.isFinite(confirmedQty) || confirmedQty < 0) continue;
-      await PurchaseOrderItem.update(
-        { supplierQuantity: confirmedQty },
-        { where: { id: idNum, purchaseOrderId: po.id } }
-      );
+
+      const poItem = await PurchaseOrderItem.findByPk(idNum);
+      if (poItem) {
+        const ps = Number(poItem.packSize || 1);
+        await poItem.update({
+          supplierQuantity: confirmedQty,
+          quantity: confirmedQty * ps,
+          totalPrice: (confirmedQty * ps) * Number(poItem.unitPrice || 0),
+        });
+      }
     }
   }
   await po.update({
@@ -263,18 +270,17 @@ async function generateAsn(id, body, reqUser) {
     grNumber,
     status: 'pending',
     totalExpected: (po.PurchaseOrderItems || []).reduce((acc, i) => {
-      const q = Number(i.supplierQuantity || i.quantity || 0);
-      const p = Number(i.packSize || 1);
-      return acc + (q * p);
+      const ps = Number(i.packSize || 1);
+      const total = i.supplierQuantity > 0 ? Number(i.supplierQuantity) * ps : Number(i.quantity || 0);
+      return acc + total;
     }, 0),
     totalReceived: 0,
     notes: body.notes || `ASN generated from ${po.poNumber}`,
   });
 
   const grItems = (po.PurchaseOrderItems || []).map(i => {
-    const qty = Number(i.supplierQuantity || i.quantity || 0);
     const ps = Number(i.packSize || 1);
-    const total = qty * ps;
+    const total = i.supplierQuantity > 0 ? Number(i.supplierQuantity) * ps : Number(i.quantity || 0);
     return {
       goodsReceiptId: gr.id,
       productId: i.productId,
@@ -396,14 +402,15 @@ async function createFromCsv(body, reqUser) {
       const mappedById = supplierMappings.find((m) => Number(m.productId) === Number(row.productId) && m.Product);
       if (mappedById) {
         const quantity = row.finalQuantity > 0 ? row.finalQuantity : row.suggestedQuantity;
-        const unitPrice = (Number(mappedById.costPrice) || 0) / (Number(mappedById.packSize) || 1);
+        const ps = Number(mappedById.packSize) || 1;
+        const unitPrice = (Number(mappedById.costPrice) || 0) / ps;
         items.push({
           productId: mappedById.Product.id,
           productName: mappedById.supplierProductName || mappedById.Product.name,
           productSku: mappedById.supplierSku || mappedById.Product.sku,
           quantity,
           supplierQuantity: quantity,
-          packSize: Number(mappedById.packSize) || 1,
+          packSize: ps,
           unitPrice,
         });
         continue;
@@ -420,14 +427,15 @@ async function createFromCsv(body, reqUser) {
       byName.get(nameNorm);
     if (!picked) continue;
     const quantity = row.finalQuantity > 0 ? row.finalQuantity : row.suggestedQuantity;
-    const unitPrice = (Number(picked.map.costPrice) || 0) / (Number(picked.map.packSize) || 1);
+    const ps = Number(picked.map.packSize) || 1;
+    const unitPrice = (Number(picked.map.costPrice) || 0) / ps;
     items.push({
       productId: picked.product.id,
       productName: picked.map.supplierProductName || picked.product.name,
       productSku: picked.map.supplierSku || picked.product.sku,
       quantity,
       supplierQuantity: quantity,
-      packSize: Number(picked.map.packSize) || 1,
+      packSize: ps,
       unitPrice,
     });
   }
@@ -569,13 +577,11 @@ async function generatePoPdf(id, reqUser) {
   doc.fillColor('#444444').text(`Status: `, { continued: true }).fillColor('#000000').text((po.status || '').toUpperCase());
 
   // Date logic
+  // Date logic
   const orderDate = po.createdAt ? new Date(po.createdAt).toLocaleDateString('en-GB') : '-';
   doc.fillColor('#444444').text(`Order Date: `, { continued: true }).fillColor('#000000').text(orderDate);
 
-  if (po.expectedDelivery) {
-    const deliveryDate = new Date(po.expectedDelivery).toLocaleDateString('en-GB');
-    doc.fillColor('#444444').text(`Expected Delivery: `, { continued: true }).fillColor('#000000').text(deliveryDate);
-  }
+  // REMOVED: Expected Delivery as per user request
 
   doc.moveDown();
   doc.fontSize(12).fillColor('#000000').text('Order Details', { underline: true });
@@ -583,14 +589,15 @@ async function generatePoPdf(id, reqUser) {
 
   // --- TABLE HEADERS ---
   const tableTop = doc.y;
-  doc.fontSize(9).font('Helvetica-Bold').fillColor('#444444');
-  doc.text('SKU (Supplier)', 40, tableTop, { width: 80 });
-  doc.text('Product (Supplier)', 125, tableTop, { width: 150 });
-  doc.text('Qty', 275, tableTop, { width: 40, align: 'right' });
-  doc.text('Price (Pack)', 315, tableTop, { width: 65, align: 'right' });
-  doc.text('VAT%', 385, tableTop, { width: 35, align: 'right' });
-  doc.text('VAT Total', 425, tableTop, { width: 65, align: 'right' });
-  doc.text('Net Total', 495, tableTop, { width: 75, align: 'right' });
+  doc.fontSize(7.5).font('Helvetica-Bold').fillColor('#444444');
+  doc.text('Supplier SKU', 40, tableTop, { width: 65, lineBreak: false });
+  doc.text('Internal SKU', 105, tableTop, { width: 65, lineBreak: false });
+  doc.text('Product Name', 170, tableTop, { width: 105, lineBreak: false });
+  doc.text('Pack Size', 275, tableTop, { width: 45, align: 'center', lineBreak: false });
+  doc.text('Ordered Cases', 325, tableTop, { width: 60, align: 'right', lineBreak: false });
+  doc.text('Total Singles', 385, tableTop, { width: 60, align: 'right', lineBreak: false });
+  doc.text('Case Cost', 450, tableTop, { width: 55, align: 'right', lineBreak: false });
+  doc.text('Net Total', 510, tableTop, { width: 60, align: 'right', lineBreak: false });
 
   doc.moveTo(40, tableTop + 14).lineTo(570, tableTop + 14).strokeColor('#000000').lineWidth(0.5).stroke();
   doc.y = tableTop + 20;
@@ -602,40 +609,46 @@ async function generatePoPdf(id, reqUser) {
     if (doc.y > 750) {
       doc.addPage();
       // headers on new page
-      doc.fontSize(9).font('Helvetica-Bold').fillColor('#444444');
-      doc.text('SKU (Supplier)', 40, 40, { width: 80 });
-      doc.text('Product (Supplier)', 125, 40, { width: 150 });
-      doc.text('Qty', 275, 40, { width: 40, align: 'right' });
-      doc.text('Price (Pack)', 315, 40, { width: 65, align: 'right' });
-      doc.text('VAT%', 385, 40, { width: 35, align: 'right' });
-      doc.text('VAT Total', 425, 40, { width: 65, align: 'right' });
-      doc.text('Net Total', 495, 40, { width: 75, align: 'right' });
+      doc.fontSize(7.5).font('Helvetica-Bold').fillColor('#444444');
+      doc.text('Supplier SKU', 40, 40, { width: 65, lineBreak: false });
+      doc.text('Internal SKU', 105, 40, { width: 65, lineBreak: false });
+      doc.text('Product Name', 170, 40, { width: 105, lineBreak: false });
+      doc.text('Pack Size', 275, 40, { width: 45, align: 'center', lineBreak: false });
+      doc.text('Ordered Cases', 325, 40, { width: 60, align: 'right', lineBreak: false });
+      doc.text('Total Singles', 385, 40, { width: 60, align: 'right', lineBreak: false });
+      doc.text('Case Cost', 450, 40, { width: 55, align: 'right', lineBreak: false });
+      doc.text('Net Total', 510, 40, { width: 60, align: 'right', lineBreak: false });
       doc.moveTo(40, 54).lineTo(570, 54).strokeColor('#000000').lineWidth(0.5).stroke();
       doc.y = 60;
     }
 
-    const qtyValue = Number(item.quantity || 0);
-    const unitPrice = Number(item.unitPrice || 0);
+    const qtySingles = Number(item.quantity || 0);
     const packSize = Number(item.packSize || 1);
+    const orderedCases = qtySingles / packSize;
+    
+    // unitPrice in DB is price per SINGLE unit. 
+    // Case Cost = unitPrice * packSize
+    const unitPriceSingle = Number(item.unitPrice || 0);
+    const caseCost = unitPriceSingle * packSize;
+    
+    const lineNet = orderedCases * caseCost;
     const vatRate = Number(item.Product?.vatRate || 0);
-
-    const pricePerPack = unitPrice * packSize;
-    const lineNet = qtyValue * pricePerPack;
     const lineVat = lineNet * (vatRate / 100);
 
     totalNet += lineNet;
     totalVat += lineVat;
 
     const rowY = doc.y;
-    doc.fontSize(8).font('Helvetica').fillColor('#000000');
+    doc.fontSize(7).font('Helvetica').fillColor('#000000');
 
-    doc.text(item.productSku || '-', 40, rowY, { width: 80, ellipsis: true });
-    doc.text(item.productName || '-', 125, rowY, { width: 150, ellipsis: true });
-    doc.text(qtyValue % 1 === 0 ? String(qtyValue) : qtyValue.toFixed(2), 275, rowY, { width: 40, align: 'right' });
-    doc.text(`£${pricePerPack.toFixed(2)}`, 315, rowY, { width: 65, align: 'right' });
-    doc.text(`${vatRate}%`, 385, rowY, { width: 35, align: 'right' });
-    doc.text(`£${lineVat.toFixed(2)}`, 425, rowY, { width: 65, align: 'right' });
-    doc.text(`£${lineNet.toFixed(2)}`, 495, rowY, { width: 75, align: 'right' });
+    doc.text(item.productSku || '-', 40, rowY, { width: 65, ellipsis: true });
+    doc.text(item.Product?.sku || '-', 105, rowY, { width: 65, ellipsis: true });
+    doc.text(item.productName || '-', 170, rowY, { width: 110, ellipsis: true });
+    doc.text(String(packSize), 280, rowY, { width: 35, align: 'center' });
+    doc.text(orderedCases % 1 === 0 ? String(orderedCases) : orderedCases.toFixed(2), 315, rowY, { width: 60, align: 'right' });
+    doc.text(String(qtySingles), 375, rowY, { width: 60, align: 'right' });
+    doc.text(`£${caseCost.toFixed(2)}`, 445, rowY, { width: 55, align: 'right' });
+    doc.text(`£${lineNet.toFixed(2)}`, 510, rowY, { width: 60, align: 'right' });
 
     doc.y = rowY + 15;
   }

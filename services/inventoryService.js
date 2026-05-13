@@ -174,6 +174,7 @@ async function listProducts(reqUser, query = {}) {
         required: false,
         where: query.supplierId ? { supplierId: query.supplierId } : undefined
       },
+      { association: 'Supplier', attributes: ['id', 'name'], required: false },
     ],
     subQuery: false, // Required when using Op.or with includes
   });
@@ -183,8 +184,8 @@ async function listProducts(reqUser, query = {}) {
 async function exportProductsCsv(reqUser, query = {}) {
   const products = await listProducts(reqUser, query);
   const headers = [
-    'SKU', 'Name', 'Barcode', 'Category', 'Supplier', 'Status', 'Price', 'Cost Price',
-    'VAT Rate', 'Weight', 'Dimensions', 'Reorder Level', 'Stock (Total)', 'Description'
+    'SKU', 'Name', 'Barcode', 'Category', 'Supplier', 'Status', 'Price', 'Cost Price', 'Pack Size',
+    'VAT Rate', 'UOM', 'Color', 'Heat Sensitive', 'Batch Tracking', 'Weight', 'Dimensions', 'Reorder Level', 'Stock (Total)', 'Description', 'Images'
   ];
 
   const rows = products.map(p => {
@@ -201,12 +202,18 @@ async function exportProductsCsv(reqUser, query = {}) {
       p.status,
       p.price,
       p.costPrice,
+      p.packSize || 1,
       p.vatRate,
+      p.unitOfMeasure || '',
+      p.color || '',
+      p.heatSensitive || 'no',
+      p.requireBatchTracking || 'no',
       weight,
       dims,
       p.reorderLevel,
       totalStock,
-      p.description || ''
+      p.description || '',
+      Array.isArray(p.images) ? p.images.join(',') : (p.images || '')
     ];
   });
 
@@ -300,7 +307,13 @@ async function createProduct(data, reqUser) {
     reorderQty: data.reorderQty != null ? data.reorderQty : null,
     maxStock: data.maxStock != null ? data.maxStock : null,
     status: data.status || 'ACTIVE',
-    images: Array.isArray(data.images) ? data.images : null,
+    images: (function() {
+      if (Array.isArray(data.images)) return data.images;
+      if (typeof data.images === 'string' && data.images.trim()) {
+        return data.images.split(',').map(u => u.trim()).filter(Boolean);
+      }
+      return null;
+    })(),
     cartons: Array.isArray(data.cartons) && data.cartons.length > 0 ? data.cartons : null,
     priceLists: data.priceLists && typeof data.priceLists === 'object' ? data.priceLists : null,
     supplierProducts: Array.isArray(data.supplierProducts) ? data.supplierProducts : null,
@@ -452,7 +465,13 @@ async function bulkCreateProducts(productsArray, reqUser) {
         reorderQty: data.reorderQty != null ? Number(data.reorderQty) : null,
         maxStock: data.maxStock != null ? Number(data.maxStock) : null,
         status: data.status && String(data.status).toUpperCase() === 'INACTIVE' ? 'INACTIVE' : 'ACTIVE',
-        images: Array.isArray(data.images) ? data.images : null,
+        images: (function() {
+          if (Array.isArray(data.images)) return data.images;
+          if (typeof data.images === 'string' && data.images.trim()) {
+            return data.images.split(',').map(u => u.trim()).filter(Boolean);
+          }
+          return null;
+        })(),
         cartons: Array.isArray(data.cartons) && data.cartons.length > 0 ? data.cartons : null,
         priceLists: data.priceLists && typeof data.priceLists === 'object' ? data.priceLists : null,
         supplierProducts: Array.isArray(data.supplierProducts) ? data.supplierProducts : null,
@@ -513,7 +532,15 @@ async function updateProduct(id, data, reqUser) {
   if (data.reorderQty !== undefined) upd.reorderQty = data.reorderQty;
   if (data.maxStock !== undefined) upd.maxStock = data.maxStock;
   if (data.status !== undefined) upd.status = data.status ?? product.status;
-  if (data.images !== undefined) upd.images = Array.isArray(data.images) ? data.images : product.images;
+  if (data.images !== undefined) {
+    if (Array.isArray(data.images)) {
+      upd.images = data.images;
+    } else if (typeof data.images === 'string') {
+      upd.images = data.images.trim() ? data.images.split(',').map(u => u.trim()).filter(Boolean) : null;
+    } else {
+      upd.images = product.images;
+    }
+  }
   if (data.cartons !== undefined) upd.cartons = Array.isArray(data.cartons) ? data.cartons : (data.cartons && typeof data.cartons === 'object' ? data.cartons : product.cartons);
   if (data.priceLists !== undefined) upd.priceLists = data.priceLists && typeof data.priceLists === 'object' ? data.priceLists : product.priceLists;
   if (data.supplierProducts !== undefined) upd.supplierProducts = Array.isArray(data.supplierProducts) ? data.supplierProducts : product.supplierProducts;
@@ -900,8 +927,8 @@ async function createAdjustment(data, reqUser) {
       productId: data.productId,
       warehouseId: warehouseId,
       locationId: locationId || null,
-      batchNumber: batchNumber || null,
-      clientId: clientId || null
+      batchNumber: batchNumber ? String(batchNumber).trim() : null,
+      clientId: clientId ? Number(clientId) : null
     };
 
     let stock = await ProductStock.findOne({ where: stockWhere, transaction });

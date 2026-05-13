@@ -223,7 +223,7 @@ async function list(reqUser, query = {}) {
   });
 }
 
-async function listMappedProductsBySupplier(reqUser, supplierId) {
+async function listMappedProductsBySupplier(reqUser, supplierId, clientId = null) {
   const companyId = getRequestCompanyId(reqUser);
   if (!companyId) throw new Error('Company context required');
   const mappings = await SupplierProduct.findAll({
@@ -235,16 +235,21 @@ async function listMappedProductsBySupplier(reqUser, supplierId) {
     order: [['effectiveDate', 'DESC'], ['updatedAt', 'DESC']],
   });
 
-  const productIds = mappings.map((m) => m.productId).filter(Boolean);
+  const productIds = mappings.map((m) => Number(m.productId)).filter(Boolean);
+  
+  const stockWhere = { productId: { [Op.in]: productIds }, companyId };
+  if (clientId) stockWhere.clientId = clientId;
+
+  console.log(`[SupplierProductService] Fetching stock for ${productIds.length} products. ClientId: ${clientId || 'none'}`);
+
   const allStock = await ProductStock.findAll({
-    where: { productId: { [Op.in]: productIds }, companyId },
+    where: stockWhere,
     attributes: ['productId', 'quantity', 'bestBeforeDate'],
-    raw: true,
   });
 
   const stockMap = new Map();
   allStock.forEach((s) => {
-    const pid = s.productId;
+    const pid = Number(s.productId);
     if (!stockMap.has(pid)) {
       stockMap.set(pid, {
         totalStock: 0,
@@ -254,15 +259,16 @@ async function listMappedProductsBySupplier(reqUser, supplierId) {
       });
     }
     const info = stockMap.get(pid);
-    info.totalStock += Number(s.quantity || 0);
+    const qty = Number(s.quantity || 0);
+    info.totalStock += qty;
 
     const bbd = s.bestBeforeDate;
     if (bbd) {
       if (!info.nearestExpiry || bbd < info.nearestExpiry) {
         info.nearestExpiry = bbd;
-        info.nearestExpiryQty = Number(s.quantity || 0);
+        info.nearestExpiryQty = qty;
       } else if (bbd === info.nearestExpiry) {
-        info.nearestExpiryQty += Number(s.quantity || 0);
+        info.nearestExpiryQty += qty;
       }
 
       if (!info.furthestExpiry || bbd > info.furthestExpiry) {
@@ -271,9 +277,11 @@ async function listMappedProductsBySupplier(reqUser, supplierId) {
     }
   });
 
+  console.log(`[SupplierProductService] Stock Map size: ${stockMap.size}`);
+
   // Return every mapping row (multiple supplier SKUs per product are all valid PO lines).
   return mappings.map((m) => {
-    const stock = stockMap.get(m.productId) || { totalStock: 0, nearestExpiry: null, nearestExpiryQty: 0, furthestExpiry: null };
+    const stock = stockMap.get(Number(m.productId)) || { totalStock: 0, nearestExpiry: null, nearestExpiryQty: 0, furthestExpiry: null };
     return {
       mappingId: m.id,
       productId: m.Product?.id || m.productId,

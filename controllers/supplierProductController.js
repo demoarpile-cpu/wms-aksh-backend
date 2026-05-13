@@ -297,7 +297,8 @@ async function list(req, res, next) {
 
 async function listMappedProductsBySupplier(req, res, next) {
   try {
-    const data = await supplierProductService.listMappedProductsBySupplier(req.user, req.params.supplierId);
+    const { clientId } = req.query;
+    const data = await supplierProductService.listMappedProductsBySupplier(req.user, req.params.supplierId, clientId);
     res.json({ success: true, data });
   } catch (err) {
     next(err);
